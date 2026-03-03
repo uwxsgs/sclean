@@ -1,0 +1,1458 @@
+#!/bin/bash
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  sclean — Deep System Cleanup Tool for Arch/CachyOS         ║
+# ║  Version 2.2                                                    ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+# Intentionally no 'set -euo pipefail' — many commands may fail gracefully
+
+# ─── Colors & Formatting ────────────────────────────────────────────
+RED='\e[1;31m'
+GREEN='\e[1;32m'
+YELLOW='\e[1;33m'
+BLUE='\e[1;34m'
+CYAN='\e[1;36m'
+MAGENTA='\e[1;35m'
+DIM='\e[2m'
+BOLD='\e[1m'
+RESET='\e[0m'
+
+# ─── State ───────────────────────────────────────────────────────────
+DRY_RUN=false
+AUTO_YES=false
+VERBOSE=false
+LOG_FILE="$HOME/.local/share/sclean/cleanup-$(date +%Y%m%d-%H%M%S).log"
+TOTAL_FREED=0
+STEP_COUNT=0
+TOTAL_STEPS=0
+SKIPPED_CATEGORIES=()
+ENABLED_CATEGORIES=()
+
+# All available categories
+# Categories that run by default
+ALL_CATEGORIES=(
+    pacman orphans cache journal flatpak flatpak-data flatpak-cache
+    temp-files
+    user-cache coredumps thumbnails trash
+    broken-symlinks crash-reports mesa-shader
+    dev-caches old-logs systemd-failed service-leftovers
+    browser-cache
+)
+
+# Opt-in only categories (use --only pacnew to run)
+OPTIN_CATEGORIES=(pacnew deep-orphans ram-cache stale-procs)
+
+# ─── Functions ───────────────────────────────────────────────────────
+
+usage() {
+    echo -e "${BOLD}sclean${RESET} — Deep System Cleanup Tool v2.2"
+    echo ""
+    echo -e "${BOLD}Usage:${RESET} sclean [OPTIONS]"
+    echo ""
+    echo -e "${BOLD}Options:${RESET}"
+    echo "  -n, --dry-run       Show what would be cleaned without deleting"
+    echo "  -y, --yes           Skip all confirmation prompts"
+    echo "  -v, --verbose       Show detailed output"
+    echo "  -h, --help          Show this help message"
+    echo ""
+    echo -e "${BOLD}Category Filters:${RESET}"
+    echo "  --only <cat,...>    Run ONLY specified categories"
+    echo "  --skip <cat,...>    Skip specified categories"
+    echo ""
+    echo -e "${BOLD}Available Categories:${RESET}"
+    echo "  pacman          Corrupted/interrupted pacman downloads"
+    echo "  orphans         Orphaned packages (unneeded dependencies)"
+    echo "  deep-orphans    Extra orphan scan incl. optional deps (opt-in)"
+    echo "  cache           Package cache (pacman + yay)"
+    echo "  journal         Old systemd journal logs"
+    echo "  flatpak         Unused Flatpak runtimes"
+    echo "  flatpak-data    Orphaned Flatpak app data in ~/.var/app"
+    echo "  flatpak-cache   Flatpak cache/temp directories"
+    echo "  temp-files      Old files in /tmp and /var/tmp"
+    echo "  user-cache      Old files in ~/.cache"
+    echo "  coredumps       Systemd coredumps"
+    echo "  thumbnails      Thumbnail cache"
+    echo "  trash           Trash bin contents"
+    echo "  broken-symlinks Broken symbolic links in home"
+    echo "  crash-reports   Electron/Chromium crash reports"
+    echo "  mesa-shader     Mesa/GPU shader cache"
+    echo "  dev-caches      Developer tool caches (npm, pip, go, cargo, etc.)"
+    echo "  old-logs        Rotated old log files in /var/log"
+    echo "  pacnew          List .pacnew/.pacsave files (opt-in, info only)"
+    echo "  ram-cache       Drop Linux page cache (opt-in, session-level)"
+    echo "  stale-procs     Kill stale user processes with deleted binaries (opt-in)"
+    echo "  systemd-failed  Reset failed systemd units"
+    echo "  service-leftovers Clean broken/not-found systemd links/units"
+    echo "  browser-cache   Browser cache data"
+    echo ""
+    echo -e "${BOLD}Examples:${RESET}"
+    echo "  sclean                     # Full cleanup with prompts"
+    echo "  sclean -n                  # Dry run, show what would happen"
+    echo "  sclean -y                  # Auto-confirm everything"
+    echo "  sclean --only cache,journal,coredumps"
+    echo "  sclean --only deep-orphans -n"
+    echo "  sclean --only ram-cache    # Run only RAM cache refresh (opt-in)"
+    echo "  sclean --only stale-procs -n"
+    echo "  sclean --skip flatpak,dev-caches"
+    exit 0
+}
+
+log() {
+    local msg="$1"
+    mkdir -p "$(dirname "$LOG_FILE")"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $msg" >> "$LOG_FILE"
+}
+
+get_dir_size() {
+    # Returns size in KB
+    local path="$1"
+    if [[ -e "$path" ]]; then
+        du -sk "$path" 2>/dev/null | awk '{print $1}'
+    else
+        echo 0
+    fi
+}
+
+get_dir_size_human() {
+    local path="$1"
+    if [[ -e "$path" ]]; then
+        du -sh "$path" 2>/dev/null | awk '{print $1}'
+    else
+        echo "0K"
+    fi
+}
+
+track_freed() {
+    local before_kb="$1"
+    local after_kb="$2"
+    local freed=$((before_kb - after_kb))
+    if (( freed > 0 )); then
+        TOTAL_FREED=$((TOTAL_FREED + freed))
+        local freed_human
+        freed_human=$(numfmt --to=iec --from-unit=1024 "$freed" 2>/dev/null || echo "${freed}K")
+        echo -e "   ${GREEN}↳ Freed: ${freed_human}${RESET}"
+        log "Freed: ${freed_human}"
+    fi
+}
+
+human_size() {
+    numfmt --to=iec --from-unit=1024 "$1" 2>/dev/null || echo "${1}K"
+}
+
+remove_packages() {
+    local package_list="$1"
+    [[ -z "$package_list" ]] && return 0
+
+    if command -v yay &>/dev/null; then
+        echo "$package_list" | yay -Rns - --noconfirm 2>/dev/null
+    else
+        echo "$package_list" | sudo pacman -Rns - --noconfirm 2>/dev/null
+    fi
+}
+
+confirm() {
+    if $AUTO_YES; then
+        return 0
+    fi
+    local prompt="$1"
+    echo -ne "   ${CYAN}$prompt [Y/n]:${RESET} "
+    read -r answer
+    [[ -z "$answer" || "$answer" =~ ^[Yy] ]]
+}
+
+is_category_enabled() {
+    local cat="$1"
+    # If --only was used, check if category is in the list
+    if [[ ${#ENABLED_CATEGORIES[@]} -gt 0 ]]; then
+        for c in "${ENABLED_CATEGORIES[@]}"; do
+            [[ "$c" == "$cat" ]] && return 0
+        done
+        return 1
+    fi
+    # If --skip was used, check if category should be skipped
+    for c in "${SKIPPED_CATEGORIES[@]}"; do
+        [[ "$c" == "$cat" ]] && return 1
+    done
+    # Skip opt-in only categories unless explicitly requested
+    for c in "${OPTIN_CATEGORIES[@]}"; do
+        [[ "$c" == "$cat" ]] && return 1
+    done
+    return 0
+}
+
+step_header() {
+    STEP_COUNT=$((STEP_COUNT + 1))
+    echo -e "\n${YELLOW}[${STEP_COUNT}/${TOTAL_STEPS}] $1${RESET}"
+    log "=== Step $STEP_COUNT: $1 ==="
+}
+
+dry_run_msg() {
+    if $DRY_RUN; then
+        echo -e "   ${MAGENTA}[DRY RUN]${RESET} $1"
+        log "[DRY RUN] $1"
+        return 0
+    fi
+    return 1
+}
+
+# ─── Cleanup Functions ──────────────────────────────────────────────
+
+clean_pacman_downloads() {
+    is_category_enabled "pacman" || return 0
+    step_header "Removing corrupted/interrupted pacman downloads"
+
+    local before
+    before=$(get_dir_size /var/cache/pacman/pkg)
+
+    local count=0
+    count=$(find /var/cache/pacman/pkg/ -name "download-*" -o -name "*.part" 2>/dev/null | wc -l)
+
+    if (( count == 0 )); then
+        echo -e "   ${DIM}Nothing to clean.${RESET}"
+        return
+    fi
+
+    echo "   Found $count corrupted/partial files."
+    if dry_run_msg "Would remove $count files from /var/cache/pacman/pkg/"; then
+        return
+    fi
+
+    sudo rm -rf /var/cache/pacman/pkg/download-* 2>/dev/null
+    sudo rm -rf /var/cache/pacman/pkg/*.part 2>/dev/null
+
+    local after
+    after=$(get_dir_size /var/cache/pacman/pkg)
+    track_freed "$before" "$after"
+    echo -e "   ${GREEN}✓ Done.${RESET}"
+}
+
+clean_orphans() {
+    is_category_enabled "orphans" || return 0
+    step_header "Removing orphaned packages (unneeded dependencies)"
+
+    local orphans
+    orphans=$(pacman -Qdtq 2>/dev/null)
+
+    if [[ -z "$orphans" ]]; then
+        echo -e "   ${DIM}No orphaned packages found.${RESET}"
+        return
+    fi
+
+    local count
+    count=$(echo "$orphans" | wc -l)
+    echo "   Found $count orphaned packages:"
+    echo "$orphans" | sed 's/^/     - /'
+
+    if dry_run_msg "Would remove $count orphaned packages"; then
+        return
+    fi
+
+    if confirm "Remove these $count orphans?"; then
+        local current_orphans
+        current_orphans=$(pacman -Qdtq 2>/dev/null)
+        if [[ -n "$current_orphans" ]]; then
+            remove_packages "$current_orphans" || true
+        fi
+        echo -e "   ${GREEN}✓ Done.${RESET}"
+        log "Removed $count orphans"
+    else
+        echo -e "   ${DIM}Skipped.${RESET}"
+    fi
+}
+
+clean_deep_orphans() {
+    is_category_enabled "deep-orphans" || return 0
+    step_header "Removing deep orphan packages (including optional deps)"
+
+    local deep_orphans
+    deep_orphans=$(pacman -Qdttq 2>/dev/null)
+
+    if [[ -z "$deep_orphans" ]]; then
+        echo -e "   ${DIM}No deep orphans found.${RESET}"
+        return
+    fi
+
+    local count
+    count=$(echo "$deep_orphans" | wc -l)
+    echo "   Found $count deep orphan packages:"
+    echo "$deep_orphans" | sed 's/^/     - /'
+    echo -e "   ${DIM}Note: These can include optional dependencies you may still want.${RESET}"
+
+    if dry_run_msg "Would remove $count deep orphan packages"; then
+        return
+    fi
+
+    if confirm "Remove these $count deep orphans?"; then
+        local current_deep_orphans
+        current_deep_orphans=$(pacman -Qdttq 2>/dev/null)
+        if [[ -n "$current_deep_orphans" ]]; then
+            remove_packages "$current_deep_orphans" || true
+        fi
+        echo -e "   ${GREEN}✓ Done.${RESET}"
+        log "Removed $count deep orphans"
+    else
+        echo -e "   ${DIM}Skipped.${RESET}"
+    fi
+}
+
+clean_package_cache() {
+    is_category_enabled "cache" || return 0
+    step_header "Cleaning package cache (pacman + yay)"
+
+    local before
+    before=$(get_dir_size /var/cache/pacman/pkg)
+    local yay_before=0
+    [[ -d "$HOME/.cache/yay" ]] && yay_before=$(get_dir_size "$HOME/.cache/yay")
+    local total_before=$((before + yay_before))
+
+    # Show current cache size
+    echo "   Pacman cache: $(get_dir_size_human /var/cache/pacman/pkg)"
+    [[ -d "$HOME/.cache/yay" ]] && echo "   Yay cache: $(get_dir_size_human "$HOME/.cache/yay")"
+
+    if dry_run_msg "Would clean pacman + yay cache (keep last 1 version)"; then
+        return
+    fi
+
+    # Keep only 1 version of installed packages, remove all uninstalled
+    if command -v paccache &>/dev/null; then
+        if confirm "Clean cache (keep last 1 version)?"; then
+            sudo paccache -rk1 2>/dev/null || true
+            sudo paccache -ruk0 2>/dev/null || true
+            # Clean yay build cache
+            [[ -d "$HOME/.cache/yay" ]] && rm -rf "$HOME/.cache/yay"/* 2>/dev/null
+            local after
+            after=$(get_dir_size /var/cache/pacman/pkg)
+            local yay_after=0
+            [[ -d "$HOME/.cache/yay" ]] && yay_after=$(get_dir_size "$HOME/.cache/yay")
+            track_freed "$total_before" $((after + yay_after))
+            echo -e "   ${GREEN}✓ Done.${RESET}"
+        else
+            echo -e "   ${DIM}Skipped.${RESET}"
+        fi
+    else
+        echo -e "   ${DIM}paccache not found, using yay -Scc...${RESET}"
+        yay -Scc 2>/dev/null || true
+    fi
+}
+
+clean_journal() {
+    is_category_enabled "journal" || return 0
+    step_header "Cleaning old system logs (keeping last 50MB)"
+
+    local before
+    before=$(get_dir_size /var/log/journal 2>/dev/null || echo 0)
+    echo "   Current journal size: $(journalctl --disk-usage 2>/dev/null | grep -oP '[\d.,]+\s*\w+' | head -1)"
+
+    if dry_run_msg "Would vacuum journal to 50MB"; then
+        return
+    fi
+
+    sudo journalctl --vacuum-size=50M 2>/dev/null || true
+    local after
+    after=$(get_dir_size /var/log/journal 2>/dev/null || echo 0)
+    track_freed "$before" "$after"
+    echo -e "   ${GREEN}✓ Done.${RESET}"
+}
+
+clean_flatpak() {
+    is_category_enabled "flatpak" || return 0
+    step_header "Cleaning unused Flatpak runtimes"
+
+    if ! command -v flatpak &>/dev/null; then
+        echo -e "   ${DIM}Flatpak not installed. Skipping.${RESET}"
+        return
+    fi
+
+    local unused
+    unused=$(flatpak list --unused 2>/dev/null)
+
+    if [[ -z "$unused" ]]; then
+        echo -e "   ${DIM}No unused runtimes found.${RESET}"
+        return
+    fi
+
+    echo "   Unused runtimes found:"
+    echo "$unused" | sed 's/^/     /'
+
+    if dry_run_msg "Would remove unused Flatpak runtimes"; then
+        return
+    fi
+
+    if confirm "Remove unused Flatpak runtimes?"; then
+        # Prefer removing unused refs + stale app data when supported.
+        flatpak uninstall --unused --delete-data -y 2>/dev/null || flatpak uninstall --unused -y 2>/dev/null || true
+        echo -e "   ${GREEN}✓ Done.${RESET}"
+    else
+        echo -e "   ${DIM}Skipped.${RESET}"
+    fi
+}
+
+clean_flatpak_data() {
+    is_category_enabled "flatpak-data" || return 0
+    step_header "Cleaning orphaned Flatpak app data (~/.var/app)"
+
+    if ! command -v flatpak &>/dev/null; then
+        echo -e "   ${DIM}Flatpak not installed. Skipping.${RESET}"
+        return
+    fi
+
+    local data_root="$HOME/.var/app"
+    if [[ ! -d "$data_root" ]]; then
+        echo -e "   ${DIM}No Flatpak app-data directory found.${RESET}"
+        return
+    fi
+
+    local installed_apps
+    installed_apps=$(flatpak list --app --columns=application 2>/dev/null | sed '/^$/d')
+
+    local orphan_dirs=()
+    while IFS= read -r dir; do
+        local app_id
+        app_id=$(basename "$dir")
+        if [[ -n "$installed_apps" ]] && echo "$installed_apps" | grep -Fxq "$app_id"; then
+            continue
+        fi
+        orphan_dirs+=("$dir")
+    done < <(find "$data_root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+
+    if (( ${#orphan_dirs[@]} == 0 )); then
+        echo -e "   ${DIM}No orphaned Flatpak app data found.${RESET}"
+        return
+    fi
+
+    local before=0
+    local dir
+    for dir in "${orphan_dirs[@]}"; do
+        before=$((before + $(get_dir_size "$dir")))
+    done
+
+    echo "   Found ${#orphan_dirs[@]} orphaned app-data dirs ($(human_size "$before")):"
+    local shown=0
+    for dir in "${orphan_dirs[@]}"; do
+        echo "     - $(basename "$dir")"
+        shown=$((shown + 1))
+        (( shown >= 15 )) && break
+    done
+    (( ${#orphan_dirs[@]} > 15 )) && echo "     ... and $(( ${#orphan_dirs[@]} - 15 )) more"
+
+    if dry_run_msg "Would remove ${#orphan_dirs[@]} orphaned Flatpak app-data directories"; then
+        return
+    fi
+
+    if confirm "Remove these orphaned Flatpak app-data directories?"; then
+        for dir in "${orphan_dirs[@]}"; do
+            rm -rf "$dir" 2>/dev/null
+        done
+
+        local after=0
+        for dir in "${orphan_dirs[@]}"; do
+            [[ -d "$dir" ]] && after=$((after + $(get_dir_size "$dir")))
+        done
+        track_freed "$before" "$after"
+        echo -e "   ${GREEN}✓ Done.${RESET}"
+    else
+        echo -e "   ${DIM}Skipped.${RESET}"
+    fi
+}
+
+clean_flatpak_cache() {
+    is_category_enabled "flatpak-cache" || return 0
+    step_header "Cleaning Flatpak cache/temp directories"
+
+    if ! command -v flatpak &>/dev/null; then
+        echo -e "   ${DIM}Flatpak not installed. Skipping.${RESET}"
+        return
+    fi
+
+    local user_dirs=(
+        "$HOME/.cache/flatpak"
+        "$HOME/.local/share/flatpak/repo/tmp"
+        "$HOME/.local/share/flatpak/repo/cache"
+    )
+    local system_dirs=(
+        "/var/lib/flatpak/repo/tmp"
+        "/var/lib/flatpak/repo/cache"
+    )
+
+    local total_before=0
+    local found=false
+    local dir
+
+    for dir in "${user_dirs[@]}"; do
+        if [[ -d "$dir" ]]; then
+            local s
+            s=$(get_dir_size "$dir")
+            if (( s > 0 )); then
+                found=true
+                total_before=$((total_before + s))
+                echo "   $dir ($(human_size "$s"))"
+            fi
+        fi
+    done
+
+    for dir in "${system_dirs[@]}"; do
+        if [[ -d "$dir" ]]; then
+            local s
+            s=$(du -sk "$dir" 2>/dev/null | awk '{print $1}')
+            s=${s:-0}
+            if (( s > 0 )); then
+                found=true
+                total_before=$((total_before + s))
+                echo "   $dir ($(human_size "$s"))"
+            elif $VERBOSE; then
+                echo "   $dir (exists, size unavailable without elevated read)"
+            fi
+        fi
+    done
+
+    if ! $found; then
+        echo -e "   ${DIM}No Flatpak cache directories with measurable data found.${RESET}"
+        return
+    fi
+
+    if dry_run_msg "Would clear Flatpak cache/temp directories ($(human_size "$total_before"))"; then
+        return
+    fi
+
+    if confirm "Clear Flatpak cache/temp directories?"; then
+        for dir in "${user_dirs[@]}"; do
+            [[ -d "$dir" ]] && find "$dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+        done
+        for dir in "${system_dirs[@]}"; do
+            [[ -d "$dir" ]] && sudo find "$dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+        done
+
+        local total_after=0
+        for dir in "${user_dirs[@]}"; do
+            [[ -d "$dir" ]] && total_after=$((total_after + $(get_dir_size "$dir")))
+        done
+        for dir in "${system_dirs[@]}"; do
+            if [[ -d "$dir" ]]; then
+                local s
+                s=$(du -sk "$dir" 2>/dev/null | awk '{print $1}')
+                s=${s:-0}
+                total_after=$((total_after + s))
+            fi
+        done
+
+        track_freed "$total_before" "$total_after"
+        echo -e "   ${GREEN}✓ Done.${RESET}"
+    else
+        echo -e "   ${DIM}Skipped.${RESET}"
+    fi
+}
+
+clean_temp_files() {
+    is_category_enabled "temp-files" || return 0
+    step_header "Cleaning old temporary files"
+
+    local before_tmp=0
+    local before_var_tmp=0
+    before_tmp=$(du -sk /tmp 2>/dev/null | awk '{print $1}')
+    before_var_tmp=$(du -sk /var/tmp 2>/dev/null | awk '{print $1}')
+    before_tmp=${before_tmp:-0}
+    before_var_tmp=${before_var_tmp:-0}
+    local total_before=$((before_tmp + before_var_tmp))
+
+    local tmp_count=0
+    local var_tmp_count=0
+    tmp_count=$(find /tmp -xdev -mindepth 1 -mtime +3 \( -type f -o -type l \) 2>/dev/null | wc -l)
+    var_tmp_count=$(find /var/tmp -xdev -mindepth 1 -mtime +7 \( -type f -o -type l \) 2>/dev/null | wc -l)
+
+    if (( tmp_count == 0 && var_tmp_count == 0 )); then
+        echo -e "   ${DIM}No old temporary files found.${RESET}"
+        return
+    fi
+
+    echo "   /tmp: $tmp_count old files/symlinks (>3 days)"
+    echo "   /var/tmp: $var_tmp_count old files/symlinks (>7 days)"
+
+    if dry_run_msg "Would remove old files from /tmp and /var/tmp"; then
+        return
+    fi
+
+    if confirm "Remove these old temporary files?"; then
+        find /tmp -xdev -mindepth 1 -mtime +3 \( -type f -o -type l \) -delete 2>/dev/null
+        find /tmp -xdev -mindepth 1 -type d -empty -mtime +3 -delete 2>/dev/null
+        sudo find /var/tmp -xdev -mindepth 1 -mtime +7 \( -type f -o -type l \) -delete 2>/dev/null || true
+        sudo find /var/tmp -xdev -mindepth 1 -type d -empty -mtime +7 -delete 2>/dev/null || true
+
+        local after_tmp=0
+        local after_var_tmp=0
+        after_tmp=$(du -sk /tmp 2>/dev/null | awk '{print $1}')
+        after_var_tmp=$(du -sk /var/tmp 2>/dev/null | awk '{print $1}')
+        after_tmp=${after_tmp:-0}
+        after_var_tmp=${after_var_tmp:-0}
+        track_freed "$total_before" $((after_tmp + after_var_tmp))
+        echo -e "   ${GREEN}✓ Done.${RESET}"
+    else
+        echo -e "   ${DIM}Skipped.${RESET}"
+    fi
+}
+
+clean_user_cache() {
+    is_category_enabled "user-cache" || return 0
+    step_header "Cleaning old user cache files (>30 days old)"
+
+    local before
+    before=$(get_dir_size "$HOME/.cache")
+    echo "   Current cache size: $(get_dir_size_human "$HOME/.cache")"
+
+    local old_files
+    old_files=$(find "$HOME/.cache" -type f -mtime +30 2>/dev/null | wc -l)
+    local bak_files
+    bak_files=$(find "$HOME/.config" \( -name "*.bak" -o -name "*~" \) -type f 2>/dev/null | wc -l)
+
+    echo "   Found $old_files cache files older than 30 days"
+    echo "   Found $bak_files backup files in ~/.config"
+
+    if dry_run_msg "Would remove $old_files old cache files and $bak_files backup files"; then
+        return
+    fi
+
+    find "$HOME/.cache" -type f -mtime +30 -delete 2>/dev/null
+    find "$HOME/.config" -name "*.bak" -type f -delete 2>/dev/null
+    find "$HOME/.config" -name "*~" -type f -delete 2>/dev/null
+    # Clean empty directories left behind
+    find "$HOME/.cache" -type d -empty -delete 2>/dev/null
+
+    local after
+    after=$(get_dir_size "$HOME/.cache")
+    track_freed "$before" "$after"
+    echo -e "   ${GREEN}✓ Done.${RESET}"
+}
+
+clean_coredumps() {
+    is_category_enabled "coredumps" || return 0
+    step_header "Cleaning systemd coredumps"
+
+    local size
+    size=$(get_dir_size_human /var/lib/systemd/coredump 2>/dev/null || echo "0")
+    local count
+    count=$(find /var/lib/systemd/coredump -type f 2>/dev/null | wc -l)
+
+    if (( count == 0 )); then
+        echo -e "   ${DIM}No coredumps found.${RESET}"
+        return
+    fi
+
+    echo "   Found $count coredumps using $size"
+
+    if dry_run_msg "Would remove $count coredumps ($size)"; then
+        return
+    fi
+
+    if confirm "Remove all coredumps?"; then
+        local before
+        before=$(get_dir_size /var/lib/systemd/coredump)
+        sudo rm -rf /var/lib/systemd/coredump/* 2>/dev/null || true
+        local after
+        after=$(get_dir_size /var/lib/systemd/coredump)
+        track_freed "$before" "$after"
+        echo -e "   ${GREEN}✓ Done.${RESET}"
+    else
+        echo -e "   ${DIM}Skipped.${RESET}"
+    fi
+}
+
+clean_thumbnails() {
+    is_category_enabled "thumbnails" || return 0
+    step_header "Cleaning thumbnail cache"
+
+    local size="0K"
+    local before=0
+    for dir in "$HOME/.cache/thumbnails" "$HOME/.thumbnails"; do
+        if [[ -d "$dir" ]]; then
+            size=$(get_dir_size_human "$dir")
+            before=$((before + $(get_dir_size "$dir")))
+        fi
+    done
+
+    if (( before == 0 )); then
+        echo -e "   ${DIM}No thumbnail cache found.${RESET}"
+        return
+    fi
+
+    echo "   Thumbnail cache: $(human_size $before)"
+
+    if dry_run_msg "Would clear thumbnail cache"; then
+        return
+    fi
+
+    rm -rf "$HOME/.cache/thumbnails"/* 2>/dev/null
+    rm -rf "$HOME/.thumbnails"/* 2>/dev/null
+    echo -e "   ${GREEN}↳ Freed: $(human_size $before)${RESET}"
+    TOTAL_FREED=$((TOTAL_FREED + before))
+    echo -e "   ${GREEN}✓ Done.${RESET}"
+}
+
+clean_trash() {
+    is_category_enabled "trash" || return 0
+    step_header "Emptying trash bin"
+
+    local trash_dir="$HOME/.local/share/Trash"
+    if [[ ! -d "$trash_dir" ]] || [[ -z "$(ls -A "$trash_dir/files" 2>/dev/null)" ]]; then
+        echo -e "   ${DIM}Trash is already empty.${RESET}"
+        return
+    fi
+
+    local before
+    before=$(get_dir_size "$trash_dir")
+    local count
+    count=$(find "$trash_dir/files" -maxdepth 1 2>/dev/null | wc -l)
+    count=$((count - 1))  # subtract directory itself
+    echo "   Found $count items in trash ($(human_size $before))"
+
+    if dry_run_msg "Would empty trash ($count items, $(human_size $before))"; then
+        return
+    fi
+
+    if confirm "Empty trash?"; then
+        rm -rf "$trash_dir/files"/* 2>/dev/null
+        rm -rf "$trash_dir/info"/* 2>/dev/null
+        rm -rf "$trash_dir/expunged"/* 2>/dev/null
+        track_freed "$before" 0
+        echo -e "   ${GREEN}✓ Done.${RESET}"
+    else
+        echo -e "   ${DIM}Skipped.${RESET}"
+    fi
+}
+
+clean_broken_symlinks() {
+    is_category_enabled "broken-symlinks" || return 0
+    step_header "Finding broken symbolic links in home directory"
+
+    # Filter out runtime/expected broken symlinks (Chrome Singleton files, snap, etc.)
+    local broken
+    broken=$(find "$HOME" -maxdepth 4 -xtype l 2>/dev/null | grep -v \
+        -e 'SingletonLock' \
+        -e 'SingletonCookie' \
+        -e 'SingletonSocket' \
+        -e '.snap/' \
+        -e '/run/' \
+        -e '/proc/' \
+        -e '.steam/' \
+    )
+
+    if [[ -z "$broken" ]]; then
+        echo -e "   ${DIM}No broken symlinks found.${RESET}"
+        return
+    fi
+
+    local count
+    count=$(echo "$broken" | wc -l)
+    echo "   Found $count broken symlinks:"
+    echo "$broken" | head -20 | sed 's/^/     /'
+    (( count > 20 )) && echo "     ... and $((count - 20)) more"
+
+    if dry_run_msg "Would remove $count broken symlinks"; then
+        return
+    fi
+
+    if confirm "Remove $count broken symlinks?"; then
+        while IFS= read -r link; do
+            rm -f "$link" 2>/dev/null
+        done <<< "$broken"
+        echo -e "   ${GREEN}✓ Done.${RESET}"
+        log "Removed $count broken symlinks"
+    else
+        echo -e "   ${DIM}Skipped.${RESET}"
+    fi
+}
+
+clean_crash_reports() {
+    is_category_enabled "crash-reports" || return 0
+    step_header "Cleaning Electron/Chromium crash reports"
+
+    local crash_dirs
+    crash_dirs=$(find "$HOME" -maxdepth 5 -name "Crash Reports" -type d 2>/dev/null)
+
+    # Also look for crash dump files
+    local crash_files
+    crash_files=$(find "$HOME" -maxdepth 4 \( -name "*.dmp" -o -name "*.core" \) -type f 2>/dev/null)
+
+    if [[ -z "$crash_dirs" && -z "$crash_files" ]]; then
+        echo -e "   ${DIM}No crash reports found.${RESET}"
+        return
+    fi
+
+    local total_before=0
+    if [[ -n "$crash_dirs" ]]; then
+        echo "   Crash report directories:"
+        while IFS= read -r dir; do
+            local s
+            s=$(get_dir_size_human "$dir")
+            echo "     $dir ($s)"
+            total_before=$((total_before + $(get_dir_size "$dir")))
+        done <<< "$crash_dirs"
+    fi
+
+    if [[ -n "$crash_files" ]]; then
+        local fcount
+        fcount=$(echo "$crash_files" | wc -l)
+        echo "   Found $fcount crash dump files"
+    fi
+
+    if dry_run_msg "Would remove crash reports ($(human_size $total_before))"; then
+        return
+    fi
+
+    if confirm "Remove crash reports?"; then
+        if [[ -n "$crash_dirs" ]]; then
+            while IFS= read -r dir; do
+                rm -rf "$dir"/* 2>/dev/null
+            done <<< "$crash_dirs"
+        fi
+        if [[ -n "$crash_files" ]]; then
+            echo "$crash_files" | xargs rm -f 2>/dev/null
+        fi
+        (( total_before > 0 )) && {
+            echo -e "   ${GREEN}↳ Freed: $(human_size $total_before)${RESET}"
+            TOTAL_FREED=$((TOTAL_FREED + total_before))
+        }
+        echo -e "   ${GREEN}✓ Done.${RESET}"
+    else
+        echo -e "   ${DIM}Skipped.${RESET}"
+    fi
+}
+
+clean_mesa_shader() {
+    is_category_enabled "mesa-shader" || return 0
+    step_header "Cleaning Mesa/GPU shader cache"
+
+    local total_before=0
+    local found=false
+
+    for dir in "$HOME/.cache/mesa_shader_cache" "$HOME/.cache/mesa_shader_cache_db" \
+               "$HOME/.cache/radv_builtin_shaders64" "$HOME/.nv" \
+               "$HOME/.cache/nvidia" "$HOME/.cache/AMD"; do
+        if [[ -d "$dir" ]]; then
+            found=true
+            local s
+            s=$(get_dir_size "$dir")
+            total_before=$((total_before + s))
+            echo "   $dir ($(human_size $s))"
+        fi
+    done
+
+    # Qt shader cache
+    for dir in "$HOME/.cache"/qtshader*; do
+        if [[ -d "$dir" ]]; then
+            found=true
+            local s
+            s=$(get_dir_size "$dir")
+            total_before=$((total_before + s))
+            echo "   $dir ($(human_size $s))"
+        fi
+    done
+
+    if ! $found; then
+        echo -e "   ${DIM}No shader cache found.${RESET}"
+        return
+    fi
+
+    if dry_run_msg "Would clear shader caches ($(human_size $total_before))"; then
+        return
+    fi
+
+    if confirm "Clear shader caches? (will be regenerated as needed)"; then
+        for dir in "$HOME/.cache/mesa_shader_cache" "$HOME/.cache/mesa_shader_cache_db" \
+                   "$HOME/.cache/radv_builtin_shaders64" "$HOME/.nv" \
+                   "$HOME/.cache/nvidia" "$HOME/.cache/AMD"; do
+            [[ -d "$dir" ]] && rm -rf "$dir"/* 2>/dev/null
+        done
+        for dir in "$HOME/.cache"/qtshader*; do
+            [[ -d "$dir" ]] && rm -rf "$dir"/* 2>/dev/null
+        done
+        echo -e "   ${GREEN}↳ Freed: $(human_size $total_before)${RESET}"
+        TOTAL_FREED=$((TOTAL_FREED + total_before))
+        echo -e "   ${GREEN}✓ Done.${RESET}"
+    else
+        echo -e "   ${DIM}Skipped.${RESET}"
+    fi
+}
+
+clean_dev_caches() {
+    is_category_enabled "dev-caches" || return 0
+    step_header "Cleaning developer tool caches"
+
+    local total_before=0
+    local found=false
+
+    # Helper: check directory and accumulate size
+    check_dev_dir() {
+        local label="$1" dir="$2"
+        if [[ -d "$dir" ]]; then
+            local s
+            s=$(get_dir_size "$dir")
+            if (( s > 0 )); then
+                found=true
+                echo "   $label: $(human_size $s)"
+                total_before=$((total_before + s))
+            fi
+        fi
+    }
+
+    # npm cache (check dir directly — npm may not be in bash PATH)
+    check_dev_dir "npm cache" "$HOME/.npm"
+
+    # pip cache
+    check_dev_dir "pip cache" "$HOME/.cache/pip"
+
+    # Go module cache
+    local go_mod_dir="$HOME/go/pkg/mod"
+    command -v go &>/dev/null && go_mod_dir=$(go env GOMODCACHE 2>/dev/null || echo "$go_mod_dir")
+    check_dev_dir "Go module cache" "$go_mod_dir"
+
+    # Cargo/Rust registry cache
+    check_dev_dir "Cargo registry cache" "$HOME/.cargo/registry"
+
+    # Gradle cache
+    check_dev_dir "Gradle cache" "$HOME/.gradle/caches"
+
+    # Maven cache
+    check_dev_dir "Maven cache" "$HOME/.m2/repository"
+
+    # Composer cache
+    check_dev_dir "Composer cache" "$HOME/.cache/composer"
+
+    # Gem cache
+    check_dev_dir "Gem cache" "$HOME/.local/share/gem"
+
+    # Yarn cache
+    check_dev_dir "Yarn cache" "$HOME/.cache/yarn"
+    check_dev_dir "Yarn cache (v2+)" "$HOME/.yarn/cache"
+
+    # pnpm cache
+    check_dev_dir "pnpm cache" "$HOME/.local/share/pnpm/store"
+
+    # Playwright browsers
+    check_dev_dir "Playwright browsers" "$HOME/.cache/ms-playwright-go"
+    check_dev_dir "Playwright browsers" "$HOME/.cache/ms-playwright"
+
+    if ! $found; then
+        echo -e "   ${DIM}No developer caches found.${RESET}"
+        return
+    fi
+
+    echo "   Total: $(human_size $total_before)"
+
+    if dry_run_msg "Would clean developer caches ($(human_size $total_before))"; then
+        return
+    fi
+
+    if confirm "Clean developer caches?"; then
+        command -v npm &>/dev/null && npm cache clean --force 2>/dev/null || true
+        (command -v pip &>/dev/null || command -v pip3 &>/dev/null) && pip cache purge 2>/dev/null || true
+        command -v go &>/dev/null && go clean -modcache 2>/dev/null || true
+        if command -v cargo &>/dev/null; then
+            cargo cache -a 2>/dev/null || rm -rf "$HOME/.cargo/registry/cache"/* 2>/dev/null
+        fi
+        command -v composer &>/dev/null && composer clear-cache 2>/dev/null || true
+        # Direct directory removal for caches that don't need a tool
+        [[ -d "$HOME/.npm" ]] && rm -rf "$HOME/.npm"/_cacache 2>/dev/null
+        [[ -d "$HOME/.cache/pip" ]] && rm -rf "$HOME/.cache/pip"/* 2>/dev/null
+        [[ -d "$HOME/.gradle/caches" ]] && rm -rf "$HOME/.gradle/caches"/* 2>/dev/null
+        [[ -d "$HOME/.m2/repository" ]] && rm -rf "$HOME/.m2/repository"/* 2>/dev/null
+        [[ -d "$HOME/.cache/yarn" ]] && rm -rf "$HOME/.cache/yarn"/* 2>/dev/null
+        [[ -d "$HOME/.yarn/cache" ]] && rm -rf "$HOME/.yarn/cache"/* 2>/dev/null
+        [[ -d "$HOME/.local/share/pnpm/store" ]] && rm -rf "$HOME/.local/share/pnpm/store"/* 2>/dev/null
+        [[ -d "$HOME/.cache/ms-playwright-go" ]] && rm -rf "$HOME/.cache/ms-playwright-go"/* 2>/dev/null
+        [[ -d "$HOME/.cache/ms-playwright" ]] && rm -rf "$HOME/.cache/ms-playwright"/* 2>/dev/null
+        echo -e "   ${GREEN}↳ Freed: ~$(human_size $total_before)${RESET}"
+        TOTAL_FREED=$((TOTAL_FREED + total_before))
+        echo -e "   ${GREEN}✓ Done.${RESET}"
+    else
+        echo -e "   ${DIM}Skipped.${RESET}"
+    fi
+}
+
+clean_old_logs() {
+    is_category_enabled "old-logs" || return 0
+    step_header "Cleaning rotated/old log files"
+
+    local before
+    before=$(get_dir_size /var/log 2>/dev/null || echo 0)
+
+    # Use find without sudo first (readable files), fall back gracefully
+    local count=0
+    count=$(find /var/log -type f \( -name "*.old" -o -name "*.gz" -o -name "*.xz" -o -name "*.bz2" -o -name "*.[0-9]" -o -name "*.[0-9].gz" \) 2>/dev/null | wc -l)
+
+    if (( count == 0 )); then
+        echo -e "   ${DIM}No old log files found.${RESET}"
+        return
+    fi
+
+    echo "   Found $count rotated/compressed log files"
+
+    if dry_run_msg "Would remove $count old log files"; then
+        return
+    fi
+
+    if confirm "Remove old/rotated log files?"; then
+        sudo find /var/log -type f \( -name "*.old" -o -name "*.gz" -o -name "*.xz" -o -name "*.bz2" -o -name "*.[0-9]" -o -name "*.[0-9].gz" \) -delete 2>/dev/null || true
+        local after
+        after=$(get_dir_size /var/log 2>/dev/null || echo 0)
+        track_freed "$before" "$after"
+        echo -e "   ${GREEN}✓ Done.${RESET}"
+    else
+        echo -e "   ${DIM}Skipped.${RESET}"
+    fi
+}
+
+check_pacnew() {
+    is_category_enabled "pacnew" || return 0
+    step_header "Checking for .pacnew/.pacsave config files"
+
+    # Use locate or find without sudo to avoid password prompt
+    local files
+    files=$(find /etc -name "*.pacnew" -o -name "*.pacsave" 2>/dev/null)
+
+    if [[ -z "$files" ]]; then
+        echo -e "   ${DIM}No .pacnew or .pacsave files found. 👍${RESET}"
+        return
+    fi
+
+    echo -e "   ${YELLOW}Found config files that need manual review:${RESET}"
+    echo "$files" | sed 's/^/     ⚠ /'
+    echo -e "   ${DIM}Tip: Use 'pacdiff' or 'sudo nvim <file>' to review & merge these.${RESET}"
+    echo -e "   ${DIM}(sclean will not modify these — manual review required)${RESET}"
+    log "Found .pacnew/.pacsave files: $(echo "$files" | tr '\n' ', ')"
+}
+
+clean_systemd_failed() {
+    is_category_enabled "systemd-failed" || return 0
+    step_header "Resetting failed systemd units"
+
+    local failed
+    failed=$(systemctl --failed --plain --no-legend 2>/dev/null)
+
+    if [[ -z "$failed" ]]; then
+        echo -e "   ${DIM}No failed units. 👍${RESET}"
+        return
+    fi
+
+    echo "   Failed units:"
+    echo "$failed" | sed 's/^/     /'
+
+    if dry_run_msg "Would reset failed systemd units"; then
+        return
+    fi
+
+    sudo systemctl reset-failed 2>/dev/null || true
+    echo -e "   ${GREEN}✓ Reset complete.${RESET}"
+    log "Reset failed systemd units"
+}
+
+clean_service_leftovers() {
+    is_category_enabled "service-leftovers" || return 0
+    step_header "Cleaning leftover systemd links and not-found units"
+
+    local sys_notfound=""
+    local user_notfound=""
+    local sys_broken_links=""
+    local user_broken_links=""
+
+    sys_notfound=$(systemctl list-units --all --plain --no-legend 2>/dev/null | awk '$2=="not-found"{print $1}')
+    user_notfound=$(systemctl --user list-units --all --plain --no-legend 2>/dev/null | awk '$2=="not-found"{print $1}')
+    sys_broken_links=$(find /etc/systemd/system /etc/systemd/user -xtype l 2>/dev/null)
+    user_broken_links=$(find "$HOME/.config/systemd/user" -xtype l 2>/dev/null)
+
+    local sys_nf_count=0
+    local user_nf_count=0
+    local sys_link_count=0
+    local user_link_count=0
+    [[ -n "$sys_notfound" ]] && sys_nf_count=$(echo "$sys_notfound" | wc -l)
+    [[ -n "$user_notfound" ]] && user_nf_count=$(echo "$user_notfound" | wc -l)
+    [[ -n "$sys_broken_links" ]] && sys_link_count=$(echo "$sys_broken_links" | wc -l)
+    [[ -n "$user_broken_links" ]] && user_link_count=$(echo "$user_broken_links" | wc -l)
+
+    local total_items=$((sys_nf_count + user_nf_count + sys_link_count + user_link_count))
+    if (( total_items == 0 )); then
+        echo -e "   ${DIM}No leftover systemd links/units found.${RESET}"
+        return
+    fi
+
+    (( sys_link_count > 0 )) && echo "   Broken system links: $sys_link_count"
+    (( user_link_count > 0 )) && echo "   Broken user links: $user_link_count"
+    (( sys_nf_count > 0 )) && echo "   System not-found units: $sys_nf_count"
+    (( user_nf_count > 0 )) && echo "   User not-found units: $user_nf_count"
+
+    if dry_run_msg "Would clean $total_items leftover systemd links/units"; then
+        return
+    fi
+
+    if confirm "Remove/disable these leftover systemd entries?"; then
+        if [[ -n "$sys_broken_links" ]]; then
+            while IFS= read -r link; do
+                sudo rm -f "$link" 2>/dev/null || true
+            done <<< "$sys_broken_links"
+        fi
+        if [[ -n "$user_broken_links" ]]; then
+            while IFS= read -r link; do
+                rm -f "$link" 2>/dev/null || true
+            done <<< "$user_broken_links"
+        fi
+        if [[ -n "$sys_notfound" ]]; then
+            while IFS= read -r unit; do
+                sudo systemctl disable "$unit" 2>/dev/null || true
+                sudo systemctl reset-failed "$unit" 2>/dev/null || true
+            done <<< "$sys_notfound"
+        fi
+        if [[ -n "$user_notfound" ]]; then
+            while IFS= read -r unit; do
+                systemctl --user disable "$unit" 2>/dev/null || true
+                systemctl --user reset-failed "$unit" 2>/dev/null || true
+            done <<< "$user_notfound"
+        fi
+        sudo systemctl daemon-reload 2>/dev/null || true
+        systemctl --user daemon-reload 2>/dev/null || true
+
+        echo -e "   ${GREEN}✓ Done.${RESET}"
+        log "Cleaned leftover systemd entries: $total_items"
+    else
+        echo -e "   ${DIM}Skipped.${RESET}"
+    fi
+}
+
+clean_browser_cache() {
+    is_category_enabled "browser-cache" || return 0
+    step_header "Cleaning browser cache data"
+
+    local total_before=0
+    local found=false
+
+    # Google Chrome cache
+    local chrome_cache="$HOME/.cache/google-chrome"
+    if [[ -d "$chrome_cache" ]]; then
+        local s
+        s=$(get_dir_size "$chrome_cache")
+        if (( s > 0 )); then
+            found=true
+            echo "   Chrome cache: $(human_size $s)"
+            total_before=$((total_before + s))
+        fi
+    fi
+
+    # Chromium cache
+    local chromium_cache="$HOME/.cache/chromium"
+    if [[ -d "$chromium_cache" ]]; then
+        local s
+        s=$(get_dir_size "$chromium_cache")
+        if (( s > 0 )); then
+            found=true
+            echo "   Chromium cache: $(human_size $s)"
+            total_before=$((total_before + s))
+        fi
+    fi
+
+    # Firefox cache
+    local firefox_cache="$HOME/.cache/mozilla/firefox"
+    if [[ -d "$firefox_cache" ]]; then
+        local s
+        s=$(get_dir_size "$firefox_cache")
+        if (( s > 0 )); then
+            found=true
+            echo "   Firefox cache: $(human_size $s)"
+            total_before=$((total_before + s))
+        fi
+    fi
+
+    # Brave cache
+    local brave_cache="$HOME/.cache/BraveSoftware"
+    if [[ -d "$brave_cache" ]]; then
+        local s
+        s=$(get_dir_size "$brave_cache")
+        if (( s > 0 )); then
+            found=true
+            echo "   Brave cache: $(human_size $s)"
+            total_before=$((total_before + s))
+        fi
+    fi
+
+    # Vivaldi cache
+    local vivaldi_cache="$HOME/.cache/vivaldi"
+    if [[ -d "$vivaldi_cache" ]]; then
+        local s
+        s=$(get_dir_size "$vivaldi_cache")
+        if (( s > 0 )); then
+            found=true
+            echo "   Vivaldi cache: $(human_size $s)"
+            total_before=$((total_before + s))
+        fi
+    fi
+
+    if ! $found; then
+        echo -e "   ${DIM}No browser cache found.${RESET}"
+        return
+    fi
+
+    echo "   Total: $(human_size $total_before)"
+    echo -e "   ${DIM}Note: Browsers will regenerate cache as needed.${RESET}"
+
+    if dry_run_msg "Would clear browser caches ($(human_size $total_before))"; then
+        return
+    fi
+
+    if confirm "Clear browser caches? (close browsers first!)"; then
+        [[ -d "$chrome_cache" ]] && rm -rf "$chrome_cache"/* 2>/dev/null
+        [[ -d "$chromium_cache" ]] && rm -rf "$chromium_cache"/* 2>/dev/null
+        [[ -d "$firefox_cache" ]] && rm -rf "$firefox_cache"/* 2>/dev/null
+        [[ -d "$brave_cache" ]] && rm -rf "$brave_cache"/* 2>/dev/null
+        [[ -d "$vivaldi_cache" ]] && rm -rf "$vivaldi_cache"/* 2>/dev/null
+        echo -e "   ${GREEN}↳ Freed: $(human_size $total_before)${RESET}"
+        TOTAL_FREED=$((TOTAL_FREED + total_before))
+        echo -e "   ${GREEN}✓ Done.${RESET}"
+    else
+        echo -e "   ${DIM}Skipped.${RESET}"
+    fi
+}
+
+clean_ram_cache() {
+    is_category_enabled "ram-cache" || return 0
+    step_header "Optional session RAM cache refresh"
+
+    echo -e "   ${DIM}This drops Linux page cache. It can free RAM now, but may slow first app launches afterward.${RESET}"
+
+    local before_mem=0
+    before_mem=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null)
+    before_mem=${before_mem:-0}
+    echo "   MemAvailable before: $(human_size "$before_mem")"
+
+    if dry_run_msg "Would run: sync && sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'"; then
+        return
+    fi
+
+    if confirm "Drop page cache for this session?"; then
+        if sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null; then
+            local after_mem=0
+            after_mem=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null)
+            after_mem=${after_mem:-0}
+            local diff=$((after_mem - before_mem))
+            echo "   MemAvailable after:  $(human_size "$after_mem")"
+            if (( diff > 0 )); then
+                echo -e "   ${GREEN}↳ RAM made available: $(human_size "$diff")${RESET}"
+            else
+                echo -e "   ${DIM}MemAvailable change: $(human_size "$diff")${RESET}"
+            fi
+            echo -e "   ${GREEN}✓ Done.${RESET}"
+            log "Dropped page cache (MemAvailable delta: ${diff}KB)"
+        else
+            echo -e "   ${RED}Could not drop caches (sudo/root required).${RESET}"
+            log "RAM cache refresh failed (missing privileges)"
+        fi
+    else
+        echo -e "   ${DIM}Skipped.${RESET}"
+    fi
+}
+
+clean_stale_processes() {
+    is_category_enabled "stale-procs" || return 0
+    step_header "Terminating stale user processes (deleted executables)"
+
+    local uid
+    uid=$(id -u)
+
+    local stale_pids=()
+    local stale_meta=()
+    local total_rss=0
+
+    local proc pid proc_uid target comm rss
+    for proc in /proc/[0-9]*; do
+        pid="${proc##*/}"
+        [[ "$pid" == "$$" || "$pid" == "$PPID" ]] && continue
+        [[ -r "$proc/status" && -L "$proc/exe" ]] || continue
+
+        proc_uid=$(awk '/^Uid:/ {print $2}' "$proc/status" 2>/dev/null)
+        [[ "$proc_uid" == "$uid" ]] || continue
+
+        target=$(readlink "$proc/exe" 2>/dev/null || true)
+        [[ "$target" == *"(deleted)"* ]] || continue
+
+        comm=$(awk '/^Name:/ {print $2}' "$proc/status" 2>/dev/null)
+        rss=$(awk '/^VmRSS:/ {print $2}' "$proc/status" 2>/dev/null)
+        rss=${rss:-0}
+
+        stale_pids+=("$pid")
+        stale_meta+=("$pid:$comm:$rss")
+        total_rss=$((total_rss + rss))
+    done
+
+    local count=${#stale_pids[@]}
+    if (( count == 0 )); then
+        echo -e "   ${DIM}No stale user processes found.${RESET}"
+        return
+    fi
+
+    echo "   Found $count stale user processes (RSS: ~$(human_size "$total_rss"))"
+    local shown=0
+    local item
+    for item in "${stale_meta[@]}"; do
+        local p c r
+        IFS=':' read -r p c r <<< "$item"
+        echo "     PID $p  $c  RSS $(human_size "$r")"
+        shown=$((shown + 1))
+        (( shown >= 15 )) && break
+    done
+    (( count > 15 )) && echo "     ... and $((count - 15)) more"
+
+    if dry_run_msg "Would terminate $count stale user processes"; then
+        return
+    fi
+
+    if confirm "Terminate these stale processes?"; then
+        kill -TERM "${stale_pids[@]}" 2>/dev/null || true
+        sleep 1
+
+        local still_alive=()
+        for pid in "${stale_pids[@]}"; do
+            kill -0 "$pid" 2>/dev/null && still_alive+=("$pid")
+        done
+
+        if (( ${#still_alive[@]} > 0 )); then
+            kill -KILL "${still_alive[@]}" 2>/dev/null || true
+            sleep 1
+        fi
+
+        local remaining=0
+        for pid in "${stale_pids[@]}"; do
+            kill -0 "$pid" 2>/dev/null && remaining=$((remaining + 1))
+        done
+        local terminated=$((count - remaining))
+
+        echo "   Terminated $terminated/$count stale processes."
+        (( remaining > 0 )) && echo -e "   ${DIM}$remaining process(es) could not be terminated.${RESET}"
+        echo -e "   ${GREEN}✓ Done.${RESET}"
+        log "Stale process cleanup: terminated $terminated of $count"
+    else
+        echo -e "   ${DIM}Skipped.${RESET}"
+    fi
+}
+
+# ─── Summary Report ─────────────────────────────────────────────────
+
+print_summary() {
+    local after_disk
+    after_disk=$(df --output=avail / 2>/dev/null | tail -1 | tr -d ' ')
+
+    echo ""
+    echo -e "${BOLD}╔══════════════════════════════════════════════════════════╗${RESET}"
+    echo -e "${BOLD}║              🧹 Cleanup Summary Report                  ║${RESET}"
+    echo -e "${BOLD}╠══════════════════════════════════════════════════════════╣${RESET}"
+
+    if (( TOTAL_FREED > 0 )); then
+        local freed_human
+        freed_human=$(human_size $TOTAL_FREED)
+        echo -e "${BOLD}║${RESET}  ${GREEN}Total space freed: ~${freed_human}${RESET}"
+    else
+        echo -e "${BOLD}║${RESET}  ${DIM}No significant space was freed.${RESET}"
+    fi
+
+    echo -e "${BOLD}║${RESET}  Disk available:  $(df -h --output=avail / 2>/dev/null | tail -1 | tr -d ' ')"
+    echo -e "${BOLD}║${RESET}  Disk used:       $(df -h --output=pcent / 2>/dev/null | tail -1 | tr -d ' ')"
+
+    if $DRY_RUN; then
+        echo -e "${BOLD}║${RESET}"
+        echo -e "${BOLD}║${RESET}  ${MAGENTA}This was a DRY RUN — nothing was actually deleted.${RESET}"
+        echo -e "${BOLD}║${RESET}  ${MAGENTA}Run without -n to perform actual cleanup.${RESET}"
+    fi
+
+    echo -e "${BOLD}║${RESET}"
+    echo -e "${BOLD}║${RESET}  Log: ${DIM}$LOG_FILE${RESET}"
+    echo -e "${BOLD}╚══════════════════════════════════════════════════════════╝${RESET}"
+    echo ""
+
+    log "=== SUMMARY: Freed approximately $(human_size $TOTAL_FREED) ==="
+}
+
+# ─── Argument Parsing ────────────────────────────────────────────────
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -n|--dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        -y|--yes)
+            AUTO_YES=true
+            shift
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        --only)
+            IFS=',' read -ra ENABLED_CATEGORIES <<< "$2"
+            shift 2
+            ;;
+        --skip)
+            IFS=',' read -ra SKIPPED_CATEGORIES <<< "$2"
+            shift 2
+            ;;
+        *)
+            echo -e "${RED}Unknown option: $1${RESET}"
+            echo "Use --help for usage information."
+            exit 1
+            ;;
+    esac
+done
+
+# ─── Count enabled steps ─────────────────────────────────────────────
+
+for cat in "${ALL_CATEGORIES[@]}" "${OPTIN_CATEGORIES[@]}"; do
+    is_category_enabled "$cat" && TOTAL_STEPS=$((TOTAL_STEPS + 1))
+done
+
+# ─── Main ─────────────────────────────────────────────────────────────
+
+echo -e "${BLUE}"
+echo "╔══════════════════════════════════════════════════════════╗"
+echo "║        sclean — Deep System Cleanup v2.2           ║"
+echo "╚══════════════════════════════════════════════════════════╝"
+echo -e "${RESET}"
+
+if $DRY_RUN; then
+    echo -e "${MAGENTA}🔍 DRY RUN MODE — No files will be deleted.${RESET}"
+fi
+
+# Show disk usage before
+echo -e "${DIM}Disk usage before cleanup:${RESET}"
+df -h / --output=size,used,avail,pcent | head -2
+echo ""
+
+log "=== sclean v2.2 started ==="
+log "Dry run: $DRY_RUN | Auto yes: $AUTO_YES"
+
+# Run all enabled cleanup functions
+clean_pacman_downloads
+clean_orphans
+clean_deep_orphans
+clean_package_cache
+clean_journal
+clean_flatpak
+clean_flatpak_data
+clean_flatpak_cache
+clean_temp_files
+clean_user_cache
+clean_coredumps
+clean_thumbnails
+clean_trash
+clean_broken_symlinks
+clean_crash_reports
+clean_mesa_shader
+clean_dev_caches
+clean_old_logs
+check_pacnew
+clean_systemd_failed
+clean_service_leftovers
+clean_browser_cache
+clean_ram_cache
+clean_stale_processes
+
+# Final summary
+print_summary
+
+echo -e "${GREEN}✨ System cleanup complete!${RESET}"
