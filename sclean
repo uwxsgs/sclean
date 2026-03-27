@@ -1,7 +1,7 @@
 #!/bin/bash
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  sclean — Deep System Cleanup Tool for Arch/CachyOS         ║
-# ║  Version 2.2                                                    ║
+# ║  Version 3.0                                                    ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
 # Intentionally no 'set -euo pipefail' — many commands may fail gracefully
@@ -21,7 +21,10 @@ RESET='\e[0m'
 DRY_RUN=false
 AUTO_YES=false
 VERBOSE=false
+INTERACTIVE_UI=false
 LOG_FILE="$HOME/.local/share/sclean/cleanup-$(date +%Y%m%d-%H%M%S).log"
+LOG_READY=false
+LOG_DISABLED=false
 TOTAL_FREED=0
 STEP_COUNT=0
 TOTAL_STEPS=0
@@ -32,20 +35,20 @@ ENABLED_CATEGORIES=()
 # Categories that run by default
 ALL_CATEGORIES=(
     pacman orphans cache journal flatpak flatpak-data flatpak-cache
-    temp-files
-    user-cache coredumps thumbnails trash
+    temp-files user-cache
+    coredumps thumbnails trash
     broken-symlinks crash-reports mesa-shader
     dev-caches old-logs systemd-failed service-leftovers
     browser-cache
 )
 
-# Opt-in only categories (use --only pacnew to run)
-OPTIN_CATEGORIES=(pacnew deep-orphans ram-cache stale-procs)
+# Opt-in only categories (use --only <cat> to run)
+OPTIN_CATEGORIES=(pacnew foreign-packages deep-orphans stale-procs tmpfiles-clean locale-purge docker snap kde-cache)
 
 # ─── Functions ───────────────────────────────────────────────────────
 
 usage() {
-    echo -e "${BOLD}sclean${RESET} — Deep System Cleanup Tool v2.2"
+    echo -e "${BOLD}sclean${RESET} — Deep System Cleanup Tool v3.0"
     echo ""
     echo -e "${BOLD}Usage:${RESET} sclean [OPTIONS]"
     echo ""
@@ -53,6 +56,8 @@ usage() {
     echo "  -n, --dry-run       Show what would be cleaned without deleting"
     echo "  -y, --yes           Skip all confirmation prompts"
     echo "  -v, --verbose       Show detailed output"
+    echo "  -i, --interactive   Launch interactive UI wizard"
+    echo "      --ui            Alias for --interactive"
     echo "  -h, --help          Show this help message"
     echo ""
     echo -e "${BOLD}Category Filters:${RESET}"
@@ -69,7 +74,6 @@ usage() {
     echo "  flatpak-data    Orphaned Flatpak app data in ~/.var/app"
     echo "  flatpak-cache   Flatpak cache/temp directories"
     echo "  temp-files      Old files in /tmp and /var/tmp"
-    echo "  user-cache      Old files in ~/.cache"
     echo "  coredumps       Systemd coredumps"
     echo "  thumbnails      Thumbnail cache"
     echo "  trash           Trash bin contents"
@@ -79,11 +83,17 @@ usage() {
     echo "  dev-caches      Developer tool caches (npm, pip, go, cargo, etc.)"
     echo "  old-logs        Rotated old log files in /var/log"
     echo "  pacnew          List .pacnew/.pacsave files (opt-in, info only)"
-    echo "  ram-cache       Drop Linux page cache (opt-in, session-level)"
+    echo "  foreign-packages List manually installed AUR or dropped packages (opt-in, info only)"
+
     echo "  stale-procs     Kill stale user processes with deleted binaries (opt-in)"
     echo "  systemd-failed  Reset failed systemd units"
     echo "  service-leftovers Clean broken/not-found systemd links/units"
     echo "  browser-cache   Browser cache data"
+    echo "  locale-purge    Clean unused locale/translation files (opt-in)"
+    echo "  docker          Prune containers, images, volumes & build cache (opt-in)"
+    echo "  snap            Remove old snap revisions (keeps current) (opt-in)"
+    echo "  kde-cache       Clean KDE/Plasma offline caches (opt-in)"
+    echo "  tmpfiles-clean  Run systemd-tmpfiles aging rules (opt-in)"
     echo ""
     echo -e "${BOLD}Examples:${RESET}"
     echo "  sclean                     # Full cleanup with prompts"
@@ -91,16 +101,382 @@ usage() {
     echo "  sclean -y                  # Auto-confirm everything"
     echo "  sclean --only cache,journal,coredumps"
     echo "  sclean --only deep-orphans -n"
-    echo "  sclean --only ram-cache    # Run only RAM cache refresh (opt-in)"
+
     echo "  sclean --only stale-procs -n"
     echo "  sclean --skip flatpak,dev-caches"
     exit 0
 }
 
+array_contains() {
+    local needle="$1"
+    shift
+    local item
+    for item in "$@"; do
+        [[ "$item" == "$needle" ]] && return 0
+    done
+    return 1
+}
+
+is_optin_category() {
+    local cat="$1"
+    local opt
+    for opt in "${OPTIN_CATEGORIES[@]}"; do
+        [[ "$opt" == "$cat" ]] && return 0
+    done
+    return 1
+}
+
+category_description() {
+    case "$1" in
+        pacman) echo "Corrupted/interrupted pacman downloads" ;;
+        orphans) echo "Orphaned packages (unneeded dependencies)" ;;
+        deep-orphans) echo "Extra orphan scan including optional deps" ;;
+        cache) echo "Package cache (pacman + yay)" ;;
+        journal) echo "Old systemd journal logs" ;;
+        flatpak) echo "Unused Flatpak runtimes" ;;
+        flatpak-data) echo "Orphaned Flatpak app data" ;;
+        flatpak-cache) echo "Flatpak cache/temp directories" ;;
+        temp-files) echo "Old files in /tmp and /var/tmp" ;;
+        user-cache) echo "Old files in ~/.cache and config backups" ;;
+        coredumps) echo "Systemd coredumps" ;;
+        thumbnails) echo "Thumbnail cache" ;;
+        trash) echo "Trash bin contents" ;;
+        broken-symlinks) echo "Broken symbolic links in home" ;;
+        crash-reports) echo "Electron/Chromium crash reports" ;;
+        mesa-shader) echo "Mesa/GPU shader cache" ;;
+        dev-caches) echo "Developer tool caches" ;;
+        old-logs) echo "Rotated/compressed logs in /var/log" ;;
+        pacnew) echo "List .pacnew/.pacsave files (info only)" ;;
+        foreign-packages) echo "Installed foreign/AUR packages (info only)" ;;
+
+        stale-procs) echo "Kill stale user processes with deleted binaries" ;;
+        systemd-failed) echo "Reset failed systemd units" ;;
+        service-leftovers) echo "Clean broken/not-found systemd entries" ;;
+        browser-cache) echo "Browser cache data" ;;
+        locale-purge) echo "Clean unused locale/translation files" ;;
+        docker) echo "Prune containers, images, volumes & build cache" ;;
+        snap) echo "Remove old snap revisions" ;;
+        kde-cache) echo "Clean KDE/Plasma runtime caches" ;;
+        tmpfiles-clean) echo "Run systemd-tmpfiles aging rules" ;;
+        *) echo "Cleanup category" ;;
+    esac
+}
+
+show_ui_header() {
+    echo -e "${BLUE}"
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║            sclean Interactive Setup Wizard              ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+    echo -e "${RESET}"
+}
+
+pick_execution_mode() {
+    while true; do
+        clear
+        show_ui_header
+        echo "Choose execution mode:"
+        echo "  1) Guided cleanup (prompts before destructive actions)"
+        echo "  2) Dry run only (preview without deleting)"
+        echo "  3) Auto-confirm cleanup (no prompts)"
+        echo "  4) Dry run + auto-confirm"
+        echo "  5) Cancel"
+        echo ""
+        read -r -p "Mode [1-5]: " mode_choice
+
+        case "$mode_choice" in
+            1)
+                DRY_RUN=false
+                AUTO_YES=false
+                return 0
+                ;;
+            2)
+                DRY_RUN=true
+                AUTO_YES=false
+                return 0
+                ;;
+            3)
+                DRY_RUN=false
+                AUTO_YES=true
+                return 0
+                ;;
+            4)
+                DRY_RUN=true
+                AUTO_YES=true
+                return 0
+                ;;
+            5)
+                return 1
+                ;;
+            *)
+                echo -e "${RED}Invalid selection.${RESET}"
+                read -r -p "Press Enter to try again..." _
+                ;;
+        esac
+    done
+}
+
+pick_categories_custom() {
+    local categories=("${ALL_CATEGORIES[@]}" "${OPTIN_CATEGORIES[@]}")
+    local selected=()
+    local cat
+    for cat in "${categories[@]}"; do
+        if array_contains "$cat" "${ALL_CATEGORIES[@]}"; then
+            selected+=(1)
+        else
+            selected+=(0)
+        fi
+    done
+
+    while true; do
+        clear
+        show_ui_header
+        echo "Custom category selection:"
+        echo ""
+
+        local idx=1
+        local total_selected=0
+        local mark desc opt_tag
+        for cat in "${categories[@]}"; do
+            if (( selected[idx-1] == 1 )); then
+                mark="x"
+                total_selected=$((total_selected + 1))
+            else
+                mark=" "
+            fi
+            desc=$(category_description "$cat")
+            opt_tag=""
+            is_optin_category "$cat" && opt_tag=" (opt-in)"
+            printf "  %2d) [%s] %-17s %s%s\n" "$idx" "$mark" "$cat" "$desc" "$opt_tag"
+            idx=$((idx + 1))
+        done
+
+        echo ""
+        echo "Selected: $total_selected/${#categories[@]}"
+        echo "Commands:"
+        echo "  <numbers>  Toggle one or more (example: 1 4 9 or 1,4,9)"
+        echo "  a          Select all categories"
+        echo "  d          Select recommended defaults"
+        echo "  o          Select opt-in only"
+        echo "  n          Select none"
+        echo "  r          Run with selected categories"
+        echo "  q          Cancel"
+        echo ""
+        read -r -p "Input: " input
+
+        case "$input" in
+            a|A)
+                local i
+                for (( i=0; i<${#selected[@]}; i++ )); do
+                    selected[i]=1
+                done
+                ;;
+            d|D)
+                local i
+                for (( i=0; i<${#categories[@]}; i++ )); do
+                    if array_contains "${categories[i]}" "${ALL_CATEGORIES[@]}"; then
+                        selected[i]=1
+                    else
+                        selected[i]=0
+                    fi
+                done
+                ;;
+            o|O)
+                local i
+                for (( i=0; i<${#categories[@]}; i++ )); do
+                    if is_optin_category "${categories[i]}"; then
+                        selected[i]=1
+                    else
+                        selected[i]=0
+                    fi
+                done
+                ;;
+            n|N)
+                local i
+                for (( i=0; i<${#selected[@]}; i++ )); do
+                    selected[i]=0
+                done
+                ;;
+            r|R)
+                ENABLED_CATEGORIES=()
+                local i
+                for (( i=0; i<${#categories[@]}; i++ )); do
+                    (( selected[i] == 1 )) && ENABLED_CATEGORIES+=("${categories[i]}")
+                done
+                if (( ${#ENABLED_CATEGORIES[@]} == 0 )); then
+                    echo -e "${RED}Select at least one category before running.${RESET}"
+                    read -r -p "Press Enter to continue..." _
+                else
+                    SKIPPED_CATEGORIES=()
+                    return 0
+                fi
+                ;;
+            q|Q)
+                return 1
+                ;;
+            *)
+                local token changed=false
+                for token in ${input//,/ }; do
+                    if [[ "$token" =~ ^[0-9]+$ ]]; then
+                        local pos=$((token - 1))
+                        if (( pos >= 0 && pos < ${#categories[@]} )); then
+                            if (( selected[pos] == 1 )); then
+                                selected[pos]=0
+                            else
+                                selected[pos]=1
+                            fi
+                            changed=true
+                        fi
+                    fi
+                done
+                if ! $changed; then
+                    echo -e "${RED}No valid input detected.${RESET}"
+                    read -r -p "Press Enter to continue..." _
+                fi
+                ;;
+        esac
+    done
+}
+
+pick_category_preset() {
+    while true; do
+        clear
+        show_ui_header
+        echo "Choose category profile:"
+        echo "  1) Recommended defaults (${#ALL_CATEGORIES[@]} categories)"
+        echo "  2) Everything (${#ALL_CATEGORIES[@]} defaults + ${#OPTIN_CATEGORIES[@]} opt-in)"
+        echo "  3) Safe quick run (cache,journal,temp-files,user-cache,trash,thumbnails,browser-cache)"
+        echo "  4) Custom selection"
+        echo "  5) Cancel"
+        echo ""
+        read -r -p "Profile [1-5]: " profile_choice
+
+        case "$profile_choice" in
+            1)
+                ENABLED_CATEGORIES=("${ALL_CATEGORIES[@]}")
+                SKIPPED_CATEGORIES=()
+                return 0
+                ;;
+            2)
+                ENABLED_CATEGORIES=("${ALL_CATEGORIES[@]}" "${OPTIN_CATEGORIES[@]}")
+                SKIPPED_CATEGORIES=()
+                return 0
+                ;;
+            3)
+                ENABLED_CATEGORIES=(
+                    cache journal temp-files trash thumbnails browser-cache
+                )
+                SKIPPED_CATEGORIES=()
+                return 0
+                ;;
+            4)
+                pick_categories_custom && return 0
+                ;;
+            5)
+                return 1
+                ;;
+            *)
+                echo -e "${RED}Invalid selection.${RESET}"
+                read -r -p "Press Enter to try again..." _
+                ;;
+        esac
+    done
+}
+
+show_ui_plan_and_confirm() {
+    while true; do
+        clear
+        show_ui_header
+        init_log_file
+        local mode_label="Guided cleanup"
+        $DRY_RUN && mode_label="Dry run"
+        $AUTO_YES && mode_label="${mode_label} + auto-confirm"
+
+        echo -e "${BOLD}Execution plan${RESET}"
+        echo "  Mode: $mode_label"
+        echo "  Categories selected: ${#ENABLED_CATEGORIES[@]}"
+        if $LOG_DISABLED; then
+            echo "  Log file: disabled (no writable path)"
+        else
+            echo "  Log file: $LOG_FILE"
+        fi
+        echo ""
+        local cat
+        for cat in "${ENABLED_CATEGORIES[@]}"; do
+            local opt_tag=""
+            is_optin_category "$cat" && opt_tag=" (opt-in)"
+            echo "  - $cat$opt_tag"
+        done
+        echo ""
+        read -r -p "Start cleanup now? [Y/n]: " start_answer
+
+        if [[ -z "$start_answer" || "$start_answer" =~ ^[Yy] ]]; then
+            return 0
+        fi
+
+        read -r -p "Edit setup (e), cancel (c), or start anyway (s)? [e/c/s]: " next_step
+        case "$next_step" in
+            s|S) return 0 ;;
+            c|C) return 1 ;;
+            e|E|*) return 2 ;;
+        esac
+    done
+}
+
+launch_interactive_ui() {
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        echo -e "${RED}Interactive mode requires a terminal (TTY).${RESET}"
+        exit 1
+    fi
+
+    while true; do
+        pick_execution_mode || {
+            echo -e "${DIM}Cancelled.${RESET}"
+            exit 0
+        }
+
+        pick_category_preset || {
+            echo -e "${DIM}Cancelled.${RESET}"
+            exit 0
+        }
+
+        show_ui_plan_and_confirm
+        local plan_status=$?
+        case "$plan_status" in
+            0) return 0 ;;
+            1)
+                echo -e "${DIM}Cancelled.${RESET}"
+                exit 0
+                ;;
+            2) ;;
+        esac
+    done
+}
+
 log() {
     local msg="$1"
-    mkdir -p "$(dirname "$LOG_FILE")"
+    init_log_file
+    $LOG_DISABLED && return 0
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $msg" >> "$LOG_FILE"
+}
+
+init_log_file() {
+    $LOG_READY && return 0
+
+    local log_dir
+    log_dir="$(dirname "$LOG_FILE")"
+    mkdir -p "$log_dir" 2>/dev/null || true
+
+    if ! { : >> "$LOG_FILE"; } 2>/dev/null; then
+        LOG_FILE="${TMPDIR:-/tmp}/sclean/cleanup-$(date +%Y%m%d-%H%M%S).log"
+        log_dir="$(dirname "$LOG_FILE")"
+        mkdir -p "$log_dir" 2>/dev/null || true
+
+        if ! { : >> "$LOG_FILE"; } 2>/dev/null; then
+            LOG_DISABLED=true
+        fi
+    fi
+
+    LOG_READY=true
 }
 
 get_dir_size() {
@@ -590,37 +966,6 @@ clean_temp_files() {
     fi
 }
 
-clean_user_cache() {
-    is_category_enabled "user-cache" || return 0
-    step_header "Cleaning old user cache files (>30 days old)"
-
-    local before
-    before=$(get_dir_size "$HOME/.cache")
-    echo "   Current cache size: $(get_dir_size_human "$HOME/.cache")"
-
-    local old_files
-    old_files=$(find "$HOME/.cache" -type f -mtime +30 2>/dev/null | wc -l)
-    local bak_files
-    bak_files=$(find "$HOME/.config" \( -name "*.bak" -o -name "*~" \) -type f 2>/dev/null | wc -l)
-
-    echo "   Found $old_files cache files older than 30 days"
-    echo "   Found $bak_files backup files in ~/.config"
-
-    if dry_run_msg "Would remove $old_files old cache files and $bak_files backup files"; then
-        return
-    fi
-
-    find "$HOME/.cache" -type f -mtime +30 -delete 2>/dev/null
-    find "$HOME/.config" -name "*.bak" -type f -delete 2>/dev/null
-    find "$HOME/.config" -name "*~" -type f -delete 2>/dev/null
-    # Clean empty directories left behind
-    find "$HOME/.cache" -type d -empty -delete 2>/dev/null
-
-    local after
-    after=$(get_dir_size "$HOME/.cache")
-    track_freed "$before" "$after"
-    echo -e "   ${GREEN}✓ Done.${RESET}"
-}
 
 clean_coredumps() {
     is_category_enabled "coredumps" || return 0
@@ -1208,43 +1553,7 @@ clean_browser_cache() {
     fi
 }
 
-clean_ram_cache() {
-    is_category_enabled "ram-cache" || return 0
-    step_header "Optional session RAM cache refresh"
 
-    echo -e "   ${DIM}This drops Linux page cache. It can free RAM now, but may slow first app launches afterward.${RESET}"
-
-    local before_mem=0
-    before_mem=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null)
-    before_mem=${before_mem:-0}
-    echo "   MemAvailable before: $(human_size "$before_mem")"
-
-    if dry_run_msg "Would run: sync && sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'"; then
-        return
-    fi
-
-    if confirm "Drop page cache for this session?"; then
-        if sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null; then
-            local after_mem=0
-            after_mem=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null)
-            after_mem=${after_mem:-0}
-            local diff=$((after_mem - before_mem))
-            echo "   MemAvailable after:  $(human_size "$after_mem")"
-            if (( diff > 0 )); then
-                echo -e "   ${GREEN}↳ RAM made available: $(human_size "$diff")${RESET}"
-            else
-                echo -e "   ${DIM}MemAvailable change: $(human_size "$diff")${RESET}"
-            fi
-            echo -e "   ${GREEN}✓ Done.${RESET}"
-            log "Dropped page cache (MemAvailable delta: ${diff}KB)"
-        else
-            echo -e "   ${RED}Could not drop caches (sudo/root required).${RESET}"
-            log "RAM cache refresh failed (missing privileges)"
-        fi
-    else
-        echo -e "   ${DIM}Skipped.${RESET}"
-    fi
-}
 
 clean_stale_processes() {
     is_category_enabled "stale-procs" || return 0
@@ -1329,6 +1638,299 @@ clean_stale_processes() {
     fi
 }
 
+clean_tmpfiles() {
+    is_category_enabled "tmpfiles-clean" || return 0
+    step_header "Running systemd-tmpfiles aging rules"
+
+    if dry_run_msg "Would run systemd-tmpfiles --clean"; then
+        return
+    fi
+    
+    if confirm "Run systemd-tmpfiles aging rules to clean old temp files?"; then
+        sudo systemd-tmpfiles --clean 2>/dev/null || true
+        echo -e "   ${GREEN}✓ Done.${RESET}"
+        log "Ran systemd-tmpfiles --clean"
+    else
+        echo -e "   ${DIM}Skipped.${RESET}"
+    fi
+}
+
+clean_user_cache() {
+    is_category_enabled "user-cache" || return 0
+    step_header "Cleaning old user caches and config backups"
+
+    local total_before=0
+    local found=false
+
+    # Search for cache files untouched for 30+ days
+    local cache_count
+    cache_count=$(find "$HOME/.cache" -mindepth 1 -type f -atime +30 2>/dev/null | wc -l)
+    
+    # Search for backup files in config/data dirs
+    local config_bak
+    config_bak=$(find "$HOME/.config" "$HOME/.local/share" -type f \( -name "*.bak" -o -name "*.old" -o -name "*~" -o -name "*.swp" -o -name "*.pacsave" \) 2>/dev/null | wc -l)
+
+    if (( cache_count == 0 && config_bak == 0 )); then
+        echo -e "   ${DIM}No old cache or backup files found.${RESET}"
+        return
+    fi
+
+    (( cache_count > 0 )) && echo "   Found $cache_count old cache file(s) (>30 days unaccessed)."
+    (( config_bak > 0 )) && echo "   Found $config_bak backup/old file(s) in .config/.local."
+
+    if dry_run_msg "Would remove old cache and config backups"; then
+        return
+    fi
+
+    if confirm "Clean old caches and config backups?"; then
+        if (( cache_count > 0 )); then
+            find "$HOME/.cache" -mindepth 1 -type f -atime +30 -delete 2>/dev/null
+            find "$HOME/.cache" -mindepth 1 -type d -empty -delete 2>/dev/null
+        fi
+        
+        if (( config_bak > 0 )); then
+            find "$HOME/.config" "$HOME/.local/share" -type f \( -name "*.bak" -o -name "*.old" -o -name "*~" -o -name "*.swp" -o -name "*.pacsave" \) -delete 2>/dev/null
+        fi
+        
+        echo -e "   ${GREEN}✓ Done.${RESET}"
+        log "Removed $cache_count old cache files, $config_bak config backups"
+    else
+        echo -e "   ${DIM}Skipped.${RESET}"
+    fi
+}
+
+check_foreign_packages() {
+    is_category_enabled "foreign-packages" || return 0
+    step_header "Checking for foreign packages (AUR / manually installed)"
+
+    local foreign_pkgs
+    foreign_pkgs=$(pacman -Qm 2>/dev/null)
+
+    if [[ -z "$foreign_pkgs" ]]; then
+        echo -e "   ${DIM}No foreign/AUR packages found. 👍${RESET}"
+        return
+    fi
+    
+    local count
+    count=$(echo "$foreign_pkgs" | wc -l)
+    echo -e "   ${YELLOW}Found $count foreign packages. These might be AUR or dropped upstream:${RESET}"
+    
+    echo "$foreign_pkgs" | head -20 | sed 's/^/     - /'
+    (( count > 20 )) && echo "     ... and $((count - 20)) more"
+    
+    echo -e "   ${DIM}Note: sclean will not modify these. Consider removing unneeded ones manually.${RESET}"
+    log "Found $count foreign packages for review."
+}
+
+clean_locale_purge() {
+    is_category_enabled "locale-purge" || return 0
+    step_header "Cleaning unused locale/translation files"
+
+    local current_lang
+    current_lang=$(echo "${LANG:-en_US.UTF-8}" | cut -d. -f1 | cut -d_ -f1)
+    local keep_locales=("en" "$current_lang" "locale.alias")
+
+    local before
+    before=$(get_dir_size /usr/share/locale 2>/dev/null || echo 0)
+
+    # Count locale dirs that aren't in our keep list
+    local removable=0
+    while IFS= read -r dir; do
+        local base
+        base=$(basename "$dir")
+        local keep=false
+        for k in "${keep_locales[@]}"; do
+            [[ "$base" == "$k"* ]] && keep=true
+        done
+        $keep || removable=$((removable + 1))
+    done < <(find /usr/share/locale -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+
+    if (( removable == 0 )); then
+        echo -e "   ${DIM}No removable locale directories found.${RESET}"
+        return
+    fi
+
+    echo "   Found $removable locale directories (keeping: ${keep_locales[*]})"
+    echo "   Current locale dir size: $(human_size $before)"
+
+    if dry_run_msg "Would remove $removable unused locale directories"; then
+        return
+    fi
+
+    if confirm "Remove unused locale directories?"; then
+        while IFS= read -r dir; do
+            local base
+            base=$(basename "$dir")
+            local keep=false
+            for k in "${keep_locales[@]}"; do
+                [[ "$base" == "$k"* ]] && keep=true
+            done
+            $keep || sudo rm -rf "$dir" 2>/dev/null
+        done < <(find /usr/share/locale -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+
+        local after
+        after=$(get_dir_size /usr/share/locale 2>/dev/null || echo 0)
+        track_freed "$before" "$after"
+        echo -e "   ${GREEN}✓ Done.${RESET}"
+        log "Removed $removable unused locale directories"
+    else
+        echo -e "   ${DIM}Skipped.${RESET}"
+    fi
+}
+
+clean_docker() {
+    is_category_enabled "docker" || return 0
+    step_header "Pruning Docker resources"
+
+    if ! command -v docker &>/dev/null; then
+        echo -e "   ${DIM}Docker not installed. Skipping.${RESET}"
+        return
+    fi
+
+    # Check if Docker daemon is running
+    if ! docker info &>/dev/null; then
+        echo -e "   ${DIM}Docker daemon not running. Skipping.${RESET}"
+        return
+    fi
+
+    local containers images volumes
+    containers=$(docker ps -a --filter status=exited -q 2>/dev/null | wc -l)
+    images=$(docker images --filter dangling=true -q 2>/dev/null | wc -l)
+    volumes=$(docker volume ls --filter dangling=true -q 2>/dev/null | wc -l)
+
+    echo "   Stopped containers: $containers"
+    echo "   Dangling images:    $images"
+    echo "   Dangling volumes:   $volumes"
+
+    if (( containers + images + volumes == 0 )); then
+        echo -e "   ${DIM}Nothing to prune.${RESET}"
+        return
+    fi
+
+    if dry_run_msg "Would prune stopped containers, dangling images/volumes & build cache"; then
+        return
+    fi
+
+    if confirm "Prune Docker resources?"; then
+        docker container prune -f 2>/dev/null || true
+        docker image prune -f 2>/dev/null || true
+        docker volume prune -f 2>/dev/null || true
+        docker builder prune -f 2>/dev/null || true
+        echo -e "   ${GREEN}✓ Done.${RESET}"
+        log "Docker pruned: $containers containers, $images images, $volumes volumes"
+    else
+        echo -e "   ${DIM}Skipped.${RESET}"
+    fi
+}
+
+clean_snap() {
+    is_category_enabled "snap" || return 0
+    step_header "Removing old snap revisions"
+
+    if ! command -v snap &>/dev/null; then
+        echo -e "   ${DIM}Snap not installed. Skipping.${RESET}"
+        return
+    fi
+
+    local old_snaps
+    old_snaps=$(snap list --all 2>/dev/null | awk '/disabled/{print $1, $3}')
+
+    if [[ -z "$old_snaps" ]]; then
+        echo -e "   ${DIM}No old snap revisions found.${RESET}"
+        return
+    fi
+
+    local count
+    count=$(echo "$old_snaps" | wc -l)
+    echo "   Found $count old snap revision(s):"
+    echo "$old_snaps" | head -10 | sed 's/^/     /'
+    (( count > 10 )) && echo "     ... and $((count - 10)) more"
+
+    if dry_run_msg "Would remove $count old snap revisions"; then
+        return
+    fi
+
+    if confirm "Remove old snap revisions?"; then
+        while IFS= read -r line; do
+            local name rev
+            name=$(echo "$line" | awk '{print $1}')
+            rev=$(echo "$line" | awk '{print $2}')
+            sudo snap remove "$name" --revision="$rev" 2>/dev/null || true
+        done <<< "$old_snaps"
+        echo -e "   ${GREEN}✓ Done.${RESET}"
+        log "Removed $count old snap revisions"
+    else
+        echo -e "   ${DIM}Skipped.${RESET}"
+    fi
+}
+
+
+clean_kde_cache() {
+    is_category_enabled "kde-cache" || return 0
+    step_header "Cleaning KDE/Plasma offline caches"
+
+    echo -e "   ${DIM}Only cleaning caches safe to remove while session is running.${RESET}"
+
+    # Safe to clean while session is running (crash metadata, http cache, old kcache files)
+    # NOT safe while live: plasmashell, kwin, ksycoca, plasma-svgelements, icon-cache
+    local kde_safe_dirs=(
+        "$HOME/.cache/kcrash-metadata"
+        "$HOME/.cache/kio_http"
+        "$HOME/.cache/kioexec"
+        "$HOME/.cache/krunner"
+        "$HOME/.cache/kcminit"
+    )
+
+    local total_before=0
+    local found=false
+
+    for pattern in "${kde_safe_dirs[@]}"; do
+        for item in $pattern; do
+            if [[ -e "$item" ]]; then
+                local s
+                s=$(get_dir_size "$item" 2>/dev/null || du -sk "$item" 2>/dev/null | awk '{print $1}')
+                s=${s:-0}
+                if (( s > 0 )); then
+                    found=true
+                    total_before=$((total_before + s))
+                fi
+            fi
+        done
+    done
+
+    if ! $found; then
+        echo -e "   ${DIM}No cleanable KDE/Plasma cache found.${RESET}"
+        return
+    fi
+
+    echo "   KDE/Plasma safe cache: $(human_size $total_before)"
+
+    if dry_run_msg "Would clear KDE/Plasma offline caches ($(human_size $total_before))"; then
+        return
+    fi
+
+    if confirm "Clear KDE/Plasma offline caches?"; then
+        for pattern in "${kde_safe_dirs[@]}"; do
+            for item in $pattern; do
+                if [[ -d "$item" ]]; then
+                    rm -rf "$item"/* 2>/dev/null
+                elif [[ -f "$item" ]]; then
+                    rm -f "$item" 2>/dev/null
+                fi
+            done
+        done
+        echo -e "   ${GREEN}↳ Freed: $(human_size $total_before)${RESET}"
+        TOTAL_FREED=$((TOTAL_FREED + total_before))
+        echo -e "   ${GREEN}✓ Done.${RESET}"
+        log "Cleaned KDE/Plasma offline caches"
+    else
+        echo -e "   ${DIM}Skipped.${RESET}"
+    fi
+}
+
+
+
+
 # ─── Summary Report ─────────────────────────────────────────────────
 
 print_summary() {
@@ -1358,7 +1960,11 @@ print_summary() {
     fi
 
     echo -e "${BOLD}║${RESET}"
-    echo -e "${BOLD}║${RESET}  Log: ${DIM}$LOG_FILE${RESET}"
+    if $LOG_DISABLED; then
+        echo -e "${BOLD}║${RESET}  Log: ${DIM}disabled (no writable path)${RESET}"
+    else
+        echo -e "${BOLD}║${RESET}  Log: ${DIM}$LOG_FILE${RESET}"
+    fi
     echo -e "${BOLD}╚══════════════════════════════════════════════════════════╝${RESET}"
     echo ""
 
@@ -1381,6 +1987,10 @@ while [[ $# -gt 0 ]]; do
             VERBOSE=true
             shift
             ;;
+        -i|--interactive|--ui)
+            INTERACTIVE_UI=true
+            shift
+            ;;
         -h|--help)
             usage
             ;;
@@ -1400,6 +2010,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Interactive setup wizard
+if $INTERACTIVE_UI; then
+    launch_interactive_ui
+fi
+
 # ─── Count enabled steps ─────────────────────────────────────────────
 
 for cat in "${ALL_CATEGORIES[@]}" "${OPTIN_CATEGORIES[@]}"; do
@@ -1410,7 +2025,7 @@ done
 
 echo -e "${BLUE}"
 echo "╔══════════════════════════════════════════════════════════╗"
-echo "║        sclean — Deep System Cleanup v2.2           ║"
+echo "║        sclean — Deep System Cleanup v3.0           ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo -e "${RESET}"
 
@@ -1423,7 +2038,7 @@ echo -e "${DIM}Disk usage before cleanup:${RESET}"
 df -h / --output=size,used,avail,pcent | head -2
 echo ""
 
-log "=== sclean v2.2 started ==="
+log "=== sclean v3.0 started ==="
 log "Dry run: $DRY_RUN | Auto yes: $AUTO_YES"
 
 # Run all enabled cleanup functions
@@ -1446,10 +2061,15 @@ clean_mesa_shader
 clean_dev_caches
 clean_old_logs
 check_pacnew
+check_foreign_packages
 clean_systemd_failed
 clean_service_leftovers
 clean_browser_cache
-clean_ram_cache
+clean_locale_purge
+clean_docker
+clean_snap
+clean_kde_cache
+clean_tmpfiles
 clean_stale_processes
 
 # Final summary
