@@ -1,2078 +1,910 @@
-#!/bin/bash
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║  sclean — Deep System Cleanup Tool for Arch/CachyOS         ║
-# ║  Version 3.0                                                    ║
-# ╚══════════════════════════════════════════════════════════════════╝
+#!/usr/bin/env python3
+"""
+sclean-tui — Visual frontend for sclean system cleanup.
+Authenticates sudo BEFORE entering TUI, then provides a clean
+interactive experience for category selection, progress, and summary.
+"""
 
-# Intentionally no 'set -euo pipefail' — many commands may fail gracefully
+import curses
+import subprocess
+import re
+import os
+import sys
+import time
+import threading
+import shutil
 
-# ─── Colors & Formatting ────────────────────────────────────────────
-RED='\e[1;31m'
-GREEN='\e[1;32m'
-YELLOW='\e[1;33m'
-BLUE='\e[1;34m'
-CYAN='\e[1;36m'
-MAGENTA='\e[1;35m'
-DIM='\e[2m'
-BOLD='\e[1m'
-RESET='\e[0m'
+# ─────────────────────────────────────────────────────────
+#  EMBEDDED SCLEAN-CORE (bash backend, compressed)
+# ─────────────────────────────────────────────────────────
 
-# ─── State ───────────────────────────────────────────────────────────
-DRY_RUN=false
-AUTO_YES=false
-VERBOSE=false
-INTERACTIVE_UI=false
-LOG_FILE="$HOME/.local/share/sclean/cleanup-$(date +%Y%m%d-%H%M%S).log"
-LOG_READY=false
-LOG_DISABLED=false
-TOTAL_FREED=0
-STEP_COUNT=0
-TOTAL_STEPS=0
-SKIPPED_CATEGORIES=()
-ENABLED_CATEGORIES=()
+import base64
+import zlib
+import tempfile
+import atexit
 
-# All available categories
-# Categories that run by default
-ALL_CATEGORIES=(
-    pacman orphans cache journal flatpak flatpak-data flatpak-cache
-    temp-files user-cache
-    coredumps thumbnails trash
-    broken-symlinks crash-reports mesa-shader
-    dev-caches old-logs systemd-failed service-leftovers
-    browser-cache
+_CORE_B85 = (
+    "c-rNCU2_}9vFJN~#RQ^4K;jalWS`v7rhO<9l3Auih96F;WCgVZ7UUiRyYTLU6iqRer~7uQPU<?9s?<&8RNaSr-"
+    "|y4?JN^av3AcN`zjm<zso2V4xh(ANOixcwPft%zch7@gbWY=>a~kI7jR)k%KmG9IpZ?>Y;=e!B?);IEyg!P<g#7r2AIMG=O~}!8U"
+    "PNQEjc=zDa-60kGE6hFmG#d%+hPCwdjE)sKY$?Md=q7PoF?Sy>Ka+#PeA(1KMR5X+JOG-CPkDKK$dVcx+Y0Vmh-"
+    "3}K{QRtB%VaWFdi*a(vQRBn)K5#{5#0u>6+j-"
+    "a+ZbtXgGz+2<^uo{=oht+vzCHa`H>^Jk7>oQN+oa`uY?8*EsC%Y%YHry;=Y4>H2uN@#3)CeI;Hzffuj4dwcu86>pxxn`e6`UGe-"
+    "0Ja50=k~RJXo?mXg=)OAM60bgmS3A2e=_3Msw!g<)gonfKQTLcWt-"
+    "+H)v7;g^qMrqg<|F9N;p^Vv$*av_ILf2O*2(dH?{)WxKYr6ae71ko<xjh>j=P6j+sC`#bbBYe{N>*Mi{A6yz3ygn>8t&h-"
+    "OlPL?T4dIeja8~ht2&?pUw4PsWm_%J%0H5;rQVoc=*-"
+    "Bmk*EHP~)sg;T(3ic3x|6cXp4qp6$VivscIa$6I^7=P=|un`@1u<L*Ikd;jFsF+8wO`05BheZ6~d(B0{6Zyk4E>>utze_HKE_Z0<"
+    "Zy@f&C8jVPJ3DY4w9Yv%MD4wNR9Odw7TRxEDJS<2yO~~mr8Nke%j*7<C-"
+    "kt%jfs$qt_F<NhG@G1<Ne=M(=Mnk0beh2=CBsozOu`HCZvX@d<pV8BVSt331jBd)?N0M3)4uf6EE-"
+    "J56GUh_K1~2^_?hAQfuB#a^dd@v{CYf!lM84azXVw{NwWgxeUyg*49y_QXz4+8$w22M9Ss5)h@9k9J`Vzv57B@?>z8pq3P#beNH0"
+    "MKi)OAAUX+UalOl+r+X)CFMMKg8{7Ded*Pp}tFG!Ih8QYEhgX7&-"
+    "2Kj(;Npyv)K@^`Q0X$xWX8>aW>qa2xnHS+G3MN_FhklPIlt=+vV<_vvw`q13kwMzOh%%BV;e=caB8F<)oV3rUNgt(W{&7s)Mq`=-"
+    "L0WBcLq{R%pQj+~NptB2#ndgEZc8^*Ox;#5xtFkxHWid+(+lwg+uM*3`C9%4hi?DX(c9SofGd!`5`<oZkRVwB-WX)p0ZuITcXXa!"
+    "kt>{RSLt*#Ag3@Tu~p#3tGGB%rv>oCD8ePl0(OnSu7O|F-_b=pA+R>Wv`L0BE@h}f0P~C|MQ&BU#OlD|rzvo(hRYx-"
+    "*i?X~C)2{J6=SU!mSI>)i}(_2?uEcs=R|*bvJ1$6A7%ryHvR>{G}aZBtx+82R3kFrTFstgv**!hqV*M#EzaYd(DyLcaqwmj5tnh-"
+    "<as=T=1Rv(&Eb{R)zvTX+aZkF{;R#$B%eh6co+kb)YP}D=QtKdbvin;s``=MlJZ)K=n}-"
+    "aJeGgkX_ieVMKtJ8^0MEe)F8b|Mrk;(uouEd{O!|cR*lK1)-"
+    "*|?XaKJU(IiR+QPKyL+9nu7kilQ~9Y}5t93~h1FHZWSRgzAaPKU4nbV^051&ggK>hFMI!r!-"
+    "ee;$+T@Y<>=)*{&%m}Ok*%Wt?8n6<>pCH_tlkn98UoWF(%T*TwZUx_VqI^9IIa55qEBP<=i@2p;iSqEPEfruW9y7ak&OC=e^S=28"
+    ")Y^N=xvajqB8tlOOK|moU9c&jKEDFn|mQOHFBl+HHO0CEA?^rxDM6JTOE^DKAOrK#Zh>{9*dJDL{u0NyCFl^(~bQJdqdkfXi)3Mc"
+    "*sR97gjet~Hnsm0$K@P^#F)KlM3A3`MF;F~T!gJ@v!3p8-JYCb23i`JbT}GpH0)-1)c=)GQG8wPnCS`@3r7Q3@!+)ZpziM%-"
+    "R808aVTzje0N*2*YNLsRNOehT_M=WA|Mud%Agk<c2mj4Okk1SVpJ*!pZJ1I`#=^zXOei#%XH&ZWiW5{$aH-fjIfQ9V23b0p7*fL5"
+    "g3*Mo-"
+    "r(QYF|1znCDjCR?dpSM2UxfovZWAO0L}@SzU37bmQqI!Bittn6_4}vG>PruceFpIL~wTOBxw;0(`lk$P(JK<AQ>7Xynn`?xwt|RV"
+    "3s#@Ih5M8-6<0~>|+NeQIe0?nr@7sEq0kIs6-_QtB6jtFixOTFdSnXo)vPLj;6r!u<<>e#-"
+    "o7{rhb~DW~u!hMq?lm<xBc0i!S4wDwnN`2<3Qxnq@Gv+a>U%k}B3I+T*Wxx}Aejn2%wd7!HBFk(@zZD3(f0muNBi;u{Iia6_L>%S"
+    "h&5bGz@t@nlrG&T{3@_xAuaZB)Xz0!lg8tAueFLE?k413C(f+zQAZQ$;+7B_m4wkgk1@wx&fIaFvjNc*?FpZ?g4C0U_X98X)=#Um"
+    "jOVmH@MgvDycTJ<*M_`m_&9y23Olz8bD5G0RK8iwm;WxNS7TEDNuDoV|0oTcDGMppr6*V7I=`s^#bLu+YB8z$x?*HBfv&(b`=4*X"
+    "Cz1jT(Z4Z{EN={Msa&oA8rCZIZWd$uEBioL>N$02#W+OcS<q<!{#!#W?Swj+6Ab&UbBL39l83>=l%kc)@Rm){VW1eDkkwZ#}3&1&"
+    "%2|u8*d`t~ZGCeil=$Ok&y(bDSINO+ZDq#?-DhAG?~WCi(0$34rs9fKXr2)Pd-nCm{KC&FKIofuV02kl3!7gQ!$7^;&$I$WD|gn0"
+    "g(~*P>3Ddg-Y`wM&O!wub4gX>@OfUa8ktYNg)C3dK^dtSma-"
+    "%Af`_0wVw_q|V4GP=0C;jgUbCimRU*C`<KJl(!XBqcp07vY@M+>SZn6RMe_gQH`GH8mi>i8EUEyK+{r1b-"
+    "$u&P7)zNMIEoEYR*osjEWju8SQ{&eUhPCMs-qC9o6eIy;Ib#)I~K7(coN51r@M%rS8c~bWjIXQo{l#;b{wx05zw|X`p8+nvzWA>Z"
+    "VcI);6UatyVgLBOOExeN$seTj|v6=sKs_^bEbz<SVLeN|`yIu4&Q()JR3b67ABcp$we{`kE5S1*wm@P1R90JVSvrKs++q1yxV1pt"
+    "2N9%RVlxsKfQ9aqm3B>FG6T!oiK9Vt$0DqklH>|D&#ka<y((GZP+x?lB?1rIteH_|gRR(Vb)d)!9^tO$2bmB<^4IqIXe$ij%50P6"
+    "x`$eRU2j2Mf|PGW0s6UZ$ps!A|luXU6jsZMqUZLHHX@s}v#YZSrCoqiQ8~DlNWC0V_0$Rgir-"
+    "Ai@SKWJd>W7tWKm*sHMP5P$-+6|4}p0ozmeY1`bLNKD{xmm}k;^@(cnF$uN$ZqZNMU@}em(a8R!o--gK3BUk7fpru}Mc%9jpT6CI"
+    "+DNz_lm;o?&~!wq2y5RAl^Fll+YNgcW*$7+U#){k`?I0C>wlUo!oMfw?IJ^csAiuo++8nLb({TU(ca#v)lb`HRo7=#edJa(<ipPG"
+    "ZgLrpVmyXKbr9y;s%d;MTUBg(fZ7=8qHM(j#{wotcm^vl96dBiuL>`^K*=4UkWK1rqSv41MLKpjto-"
+    "|C3s5%?hUuoXbhp~pz_4yc13Z~FfXl5f{N`I<)ug-Wjfcdv0*IZjAGgn7cMzE~R$%gYv!zYm$Yx%x*qSOfj1>j%ONLXbOMOBy#D*"
+    ")!OofibgLj+j*1G}}_fb!hd(HYh4zmjs_I=zM_lodL*S~9y0Uw7}OA_e~U=pmqMMK0oX}3L8r<)mQd$ak@<!=k;rB=&)1EPPuZO*"
+    "93Cu~>)#B6{Mnc5uXeQ3dF0O71;HpI!a*)*X#b{@fpV1AKREEA;MD`j9b8RC-l@CocB-aO3Tl83?iuX6G*f0%!pATt9&@gM9_Q?W"
+    "QA+hkTBY{5baxB*B9|5)@=-0E8s`4*d#dV?&PwC^n4Jg}I-"
+    "W?=4o<<UDnPhcYsdjmKWJx<TgV5R^ncz!TOoud^oyXyup%_rp7_<numla*h4)PPVs4W@{(vv2EM)i8}aHNfBjn4)26ApBfB^-"
+    "`x^s{B9P;)zo{fiAk`G$TFkJLrB>vUgQKzSGWk=g@9;6FAXF#U{odj!Hw{I?7D=e#>3AxTta7qr3nS5O1!1M&i$bOQbLW9)VYnA5"
+    "%$S$qie)zKP#%x~r+QSyn8ugZDdkK-OgGndthK9bHDod>yQ}1l1=*si^Z+U-On4#tV@*eZT(?C9hAQ+7$jsNtwKV^;1l%wS|z)-"
+    "XFTi`aKN)QQToD8dAx?mDa`UG1XEnzG>H^1k-5%KNl?Gi4CunYd0PpUo2Gx0d){8qG=K-J&$j^VP~7bhPgufpRof#i4-"
+    "T(sAL0B%JP0+Qh(zm`z6nOu(;{F_rJN<O_b1a(f;0t<B&5@7yTPgWI9$3*6yVny5My>D;;uMC57mj8m$JWYQHDHd$Sh&`t9Q-"
+    "I9Hn?dl+JqG-ui?wi`G~tIKRqfqa2%1<Z`UKPS%gsOGp5eH>uT(#A_g2i7eSfVJePAK-drc@HP)e`2V;+xZzV>I!Y3;4jD$Z>jzq"
+    "f0Yupk*6GnK9#i7A8bBX&$-Gy{&f$Ja-"
+    "!n?4Ukf(fgum==zbIAp+^BHEns+8YtmF=zZtSCeH+Rk$QB;sobnkch_gG>Y?VjhFe2Ygfqc~X*fQND)G_IbI`mwjXNxQ9JaWZ6tM"
+    "OVl`SxG#`tNMlJYYkhOq+a6%B-8_=Q;*XpElsvecihCR-HRoLF*$o!*2EAuzp$(Yp>uigDx~DQ08~3xoVn`3^tq(-"
+    "A9kb)^Bcf{8j!78)Sv3os7by2PTysKkK*`fgQuCbPta0d&n=gRS-"
+    "`&!0S93Z8pt=BGvaLZgIx})64VY8LgnOzS||2Zq(DQbDY!gj0^Y96Q^597k5yEoWuhiFkh)Q+#*`kQ?3kNWeR^&w>mHBaa$hsKs2"
+    "$(J$E<2#U@8T{sBGVy2|2$di77j;#^+|Y)#6Avm_$XnhlQ<U@rxxVcj+CmUPuoiluMbeOo_e+yucYt|`+{&Z-"
+    "tV2u#chd5oB(S6`AhuR94{^K$$KQz*ZJ8PG5l{NQ`QRxi*b@83JGsP_N*`mJB}cO({!h!@H30Gt<ddivdp+UO3BD><kW@EgX3wh8"
+    "`F*H;j@+REF|g{af-<g^n>^seZEf5OCGvgHS7wa(ukwIy=44D7$(mLJ#ckJ0<?`$zKglS(-"
+    "?qH#byEr<u?jTBOh%D*51cx@tO>92K{j*k3Q?gBW60ToccGW5xSbuJsnxZt&pk6*Vvf|>e=vPD3QM2W2Q9LOV*H;s~|0YYYPnff&"
+    "<)#|y2s(8F@G<<8GP`^K5b7c#NB^~HzV7+1r+tn`}g;0HU_-"
+    "n14yVfgL*gF04^sQ9ytLD%2%sRy!=V!|8)?En=;qGW8ObET<LB7in<r_R42M-"
+    "72;a3|EUv4}+T5i9EbteapxG%nd&MJA04#9e3600Q{6>PMoVT@J4Nt3^!zo7>$_$LX+k=_cIuj32&MrF<tFW)3jzUY86U?)Kzb>K"
+    "R>eQwCj?hV<n5dMtZ>UFFMt3^cL9KSr+**)9{&<FH(o^WWzi8cB(cfS_yo9Lg6%r;C7e7zN-MTK<JQZUMAQGuBC^7wl-"
+    "$PZx0ivtVF2E4}g_v>fc2%{#TF(q4@=mdlhO;=tHrUV@2<#&SyB)qyH%Qy67ku0s>E;k(If^zYi=!b=K5B3dVVojQb5Inydg3YzB"
+    "n;MR=s{sKz%)l?)LXMeFdl#p+JAF8W)q=f$qQ9p=&^jk;f(jxEb3+}oqS2D%3!kx9kJJZH+9T+*w4P@2)7oY9Rs5vh0T?(W9gZQn"
+    "MNp)hany$&L-2<R(2aC+eeKC7Kv7!3;d@50r5pP7_G@k9DkU$<nj4x-;`Yb?{(s4HEQu<whQX~XjWPVJ=`E`d4t-"
+    ";?e2uQGmv&<vx`1#q>Ji!#F1`*|($~Ea_!z6P7kZuk)d`0XW6aZqKx8y}_>*6jN(GLY3G_X!6dYpg3v@6^g-"
+    "4s#tupR*K;_dxD&i(;fMkTXw}rSp5t}Zn2gX9i#Tcg}^|@0NWGs^ip22J)w@a)L*Q;f;e6yjexm?TEN5RmmJsLHSl#z;2l+c}0Rj"
+    "dr8gc*vMqN|W*j~IYDeI9{<4u@21L}Kcr4m2Q0Voh?DpX&r?sHr;QjP9G}+%?hjgZ_+&9A}qf7%})D@&3}tsH*;g%EyxlU{Q$4Y}"
+    "mNFhMkgFqH?^~%}AmLEWkbWC&rj2BeaM_?<No&5f|_gHF@wa_25=B%BePHlFn#Nfen)Fg{|dQ0r9P#G>;i6I==;51IxN|`v#~e%i"
+    "e-ZjFy(=7IeRLQ-o6Sxd|8_0SaVERRw9f4n5hVVh*xH^uTb^1I5vp$=uFTwp*gJljruieFKFF6n-"
+    "n`rkF1h4_U<c<dX|}fS8dpiEpugj!8v87$SB(CPI5M^h{CI6*HvCN>lk{5JF=a9+-"
+    "d!4E>sU6&&q^Wt5>mf!%a{iv`iJcq|5}Gr2fx>md3N2~zNLIQDy~HH<~*m0h(1qMPc_0-"
+    "xYflLV=F`v`(?vclHMu3&*4wHuo1LmMhN=r%bJH*~L3b^?Q^RyYcteH|mOp*_nSA<t>7%Mxo-"
+    "5g9R!QE@`M_Nr7qwdq2dzokNtDGCAtvxB3)Q9`1ocWpFqqsuX@yFoTA0ix*ZEY7nlvtckQ+L|kUroU>k3=e7(YBESk#&LMQLE%{8"
+    "3A#r3KmP~W0nxc?ge<TL#e*!X=MgVdcOs?rlZ)u_v8<7X7DNi95jxXv2E}(eK@~d-"
+    "Wke!bZh_J`+JhvG$*RZO+SD~BF4z7Py~NxrpAZfn8+x3K4hjRfmh;Z<IxOuD=`1&DPa3C{8k2--"
+    "&`duS(OXa@w_xU9+MqabSh9egKCF~f=KIPawhX$|bJwiiEVJ7hTMJ)3VNWQtwa=bI#`4PuWR0qbY<D&Y1~VQph0cP^w*YjKVmNfY"
+    "nW_g)*PX6dN5oa@@s{4;YIDx&h&4puwtr}6O<%oc-"
+    "8rmbexK9VM5V?Y_EFHB#x_XLTrORE;cV!b&N~(J9vOoo1uD5tr!+TaUSJ69RhSeSL23&NUw7_7Ug)DWLufdBrAv<bJXRq;X0The5"
+    "V1z{gGv&eYWE~ggmHo@8P)QH$MjYT61s0dK{2V!;B^mbvw{F1d%WtJG)bUR#BzADs!&L5Ben8YQ*IT#9Tp@ZYjUF^>l1(7=CbSoO"
+    "JK)&gcAXqFa^f}qYC{D`^1)Oo-OHpvra!{Gq1zz$~HXRu9Ofg)>j`=G0d17h>Xzhb)8(Y9LMb%(&7R6nsPQ;6=X$75u_!d5;Jc_$"
+    "R`X20UM(z;IZ>T6^2&1u}>FMEV{g+BVT$$%eXO*)eEwVb?-?<Rh8+*+RQo+cm^e;wH9G-"
+    "8=|V%f$vh>?;UqrV@hJRNs&<_b8c2lcsO4egtd7(psLlJwp#uVZL6eD<0edq7KO>DG5u}Foy{k>{q7w##Im+t%n<96c_4iR({)zB"
+    "ScqbmnyHWaeegtbfs2o&+@>!K+~2HvN#KR*E()p4ox?JV&}oJr=uG=`?d7vY)&>C85#DjWV}><LUEAhTS=2#DC>i;4zZhX2*Eqij"
+    "XogzLfN};oTfoY4K$hQpJ6K(L`}o`Z(YIHRm*LYnwT`b>3(w22KZX1+(w#4*{jO`LFmPm`0>pn4fRqkveN#hCQhos215aX9&2GF<"
+    "U3Qz6W%X3&;o5Q`a)Qn{8ZsuL0FCodE=8-<R6g-Xc$Dry7_#&Q`-"
+    "!$c4jzv+Ft;x2PvzE$m8rXF;t&O8=GiyN>2%_QVeWVYQubb_merzc6c^frlmK&<_6LwxF&Y9lWnyP6NEHpyy_{tfk_lh0&M`UEbb"
+    "{HOfC22(TuM<<qX;5~<{o0{WFfVmHQ%bLURUZ1bF5c)-"
+    "ac?Fd)SFub2ng#ifXPGr5ScxD!*>~=Q*Dd&0dzKg}h9_$OkMv=1_vlvUTUJMi0h6BDdT1{H71t&mKU_xwn-"
+    "5$`wR73<0?DLe3}HcEb~#`mqdB=2}T-"
+    "d*^pcoxyV3HSglulM9D)=DN50{Ag1iGQ(%%SdcGclSwZg$d~L9P=s4&BJNUz{zBdjzu7NypX7WLOa1eA-"
+    "{I0m+wtuHMDUJp&#!fqMky-H@c0r!zdmQ@I|d5`;P(iY9EcWQhu`5l`MbEDK-M0={AW>&T6-"
+    "1Yi`6!8XRgi7QO0JR&j#++h6lmu+r^H8Ep*LOV9!R|(fcVq+ifdBhi#a1=^{I;Paq6TYAFX7rP;LG8@g8!dR!*FcXRYd%aad&&<?"
+    "*g4UbOr5o*yNR$>Q?_@l2OgmC>+9us>CQ|7`v75DSQ7pjhi4r~@^e#Rw#rGQt$1P-"
+    "+<hZXcL6<qP%%!;)da8~&_Mvo#ScF?v%VoBN!P4Curx^p%vHpR3}Ca{G5E_be#^TKgGsiD39RBA*GE2NR_w5}pCE6e`Razg--"
+    "TzrX?g-uI`*bX_L^=pfGp$?`RRo4R4Dy`+iH}X2s9lV1Y+d#&rRW16<810l9T=mt2u1H!CxLRX8LRr$$n_0@5UY_-xciJ@JZThF2"
+    "FJF@1t5it??20$Y*|s<9&$tC?mw4Y(Zp8lE%UKRGp)^sFljh2#qBiLFOh@VC?7De79>i_C_D#MKtlfTWWRFJZ^u;eEE5Xo$2|*Hh"
+    "0oHE{bDF3tzC;>E*i2s1yChJ3o@1C<3_PXBJUb7bbyf*cmfvU$NiU`uMQmQ(vHYwdn<2j)iW?^0c6(06V!K9@GgOHRnNzZ+i){eD"
+    "Dct~I43p48ZZMp(R0r{+RXK@E5Tj<tJ7eb<DSVm|8@6hFX@1J;P~~)9Ommu(nzh7YnP|Mbcq|u@O3amz#TIg!05J!y>S#qg|Acxa"
+    "PFos<HN#a#1=Y`Ul!3L<EJULVt?KT9d!YUpnhSpoYLNCxD=WvFX5Ftd+7?6wfM@HU2M7glqaGyV*p1wnFJ!r@gK{hgtYy}0n+hL{"
+    "mhJ<~-twZx7xgSWWD$A*!syZxP&7gK<EP}?7B`>_sgErEIU?V-{r<7ohS{#}iCf*)ujXt^GvUbQnB@kfmx07w_8gZ%7c%c-"
+    "XE8&h#32>;J9Oj)Uac>l!g7CY-w-E>1@+B-cwziXz?f}fkoCFmuX9DkT}%ls;oQ~!ZY;-"
+    "5|K8=h5;V5}27q31t+iAIP%Yqh<6Tc1&Z=IoEq^b5RoQ~isG^Bb`->@H<)P<-"
+    "GFH{Uo0zrmxRJk&720a)#&|YL)^Tj$V%GrDZvTT<W4;{A%UotSnyEWq>Mh2(dzqnbuMmD$^q{=l%L?rh98yO>^2aT%8Gd1|@2Hvq"
+    "UYKHj-FIY$cFE%+lHQKZ;Gmde$r4g)4!==VzeTII7Zb_sx?2va#8Fi95}D;G;u(#$DZKPp4qtK8S;`TBK8L9acZ*7Veuj2hm1}B-"
+    "J}t}Dox+8E!KgKXH)WK#=ZwkNm+2N#9S`wEdpExkt6YTmEP(SKVU-zZKo)QSa|i>Aq6>)x>sBrFlF|$<oF`{Hi)PO7&K3q<cSUXN"
+    "JYI`dmFmK?!sUG(HHlZ57(n_1FX9YE6T8irVOV6w<m#e+MJJcI^URo5^es=w;hqH0d(u3<3bGcpuR#04^QZ+0=z=Z1M2GLF^#ki#"
+    "9uDk|HVEquM`+EwCR9_L{|LImb5QR{jm6y4E8X^0x`z}%T5MIM`C-"
+    "w!D4(99crP@^4Y)uo8VxI!WW1u1MY>b+w7e`@JsFwCE$VAvS4au8`Bv?&g6}NWa(3F3Eb%|~l*fDD<|q!~=u^z>T2{rsz^?ryD=W"
+    "JXt|zv`)sx@4q;Q59cn%DVQsA`e4nxI=P2rROJRYGn5Dyo)pBz$@U0<MJ@!dPU*bpxLf`(uZC+?D4q4&G-"
+    "tFZOyNvk*1g^OyQp(N5L*C()p<eN~RBkm>nR?;0vzAO>ggPZG?%RX+W=|vosem=rm?+W|#D)yygzwH2R+?ROGV8;beMB!MzcAYmF"
+    "E$TXf*<)~jL2m+&8sTmh5~km$g2P;+pRD;@K)JgLgZBk_vR3J#A_VD^wRv1pyvQ!LCGo>@#GS{X4GVgmN>FU!$8x6<^7-"
+    "eVD}vr<OqorS`w?gKdea`i-"
+    "gL%pU%xQ5?sj3;g{lUdiv@ulu&Bp!q4TLoqOeV&9tz~jUGU%@?opmXi|GZ+c0w!C?LL)+4nFFw_FN?f(J&`6I}Gp^UOm-"
+    "ApDtZ!rE_fyuAEUMpy@lccU-rrCx8r+&o6#F?j3q?riP;*9U9A_p`f47YT3wZc$U_6^QhSBX~K#-"
+    "0p!*p{0zT>S|^cQ3~02mrIks(vf<=zG-"
+    "?5$P^?wJ0AVZzzU5%Z?LHRYH*1{nb0KZAlcnD3)M_tiOfnj91a@8Cn}equr@@L)yNcnpPGD<~vbGXiWBD%3ApD9gJ^n)o-"
+    "Qm>WROVKLV&i6Zlw8?<+89lLX3)yrwaE=yTGXFHb;k?4d+cWJ>XlBr*}LvK=fC-TZYQ~FE1A}T9(SvpQJ^<CZEDJ`*E=x_2bVpJR"
+    "mG&ytaAP@pD57D<xCLCWju&O8=I|{I}2FuN<6+6_U@b0O{~gA43>&^v)lmqfc&N~#=mkjo1O0pR`}6>B_hq~#-"
+    "@|=zMRx_nD@JWZM*QlB&{pV>v4)nv(F;9jh#CGLDoQ)T&Z2@p!OkV|2;{7g{44=`&XUyx7^9A#>Bd>cJFfmU1ah6M=qH_3C2n@Qy"
+    "5(`NB`OzL#Ppr(h0qoBju+J`GO1P1M*cg0#F+~2dA>tqAdbq@TcSH2(w<x6J}bD_72L*u4x&*`K=g`5SQ8ApEN%bXLKc+X&-"
+    "EUv^P5o2!Gc}`Bn@=G8v1+9C9T1Xh6o0AOG+JErH37Fz(`%=G{I;UH@R~_^Y-"
+    "%GNdUXYSL&jmZr}Mq&ihgtyNckv_%qpkPu#^c%#8|6lrkS;GLy-1A%_-"
+    "a+cCef$+A;t#L92<t)|1Pf)IC)nV9E5+#@9#s16vo$amduev39mQ|&ummC(hO|y#V(>ClH(#|2=;e%@q_@ign<y4}Dt#UfS5R~|;"
+    "s0K@hK{6Xp?YjbYM&EXfx&DB>3@@Xk9F+E1K^i}y5h;0W7{cMUV|Zt1Uv_7W5;kA-"
+    "`B&A=Xk5|9$YD+WT<$DVZ2CIPDtf5CHk}kH88;%9Rw1p+Cy(2zB39|>yAPNoauRuGiD!!G{lM=XxD6^(01rmtHC&o=c3y~^ta2Y@"
+    "PccVj$%Bb36`ZBb`+(D2NYhjc5?2ftI)_KmS*ZimNZ90Ha^EVd+k|6e(L@{ahb7yToM#wAD)}_)SGydx^o&m+nSW`PHNQU9KT{)y"
+    "6y{_y&CaTunjx13(jYb&#41>3swyfDD*_GKRV`SCCyfei;Eub5E?@b?Ezv@?g;z&Oh%~F8@;%-"
+    "31haekfb7tfT2r5>!H;TOk{63}xULHH;pKvEVDJJU(BB&V)KIuo`?Ff%mkz3yHd>9UBvZI>S7ph<?<K@D!I>+OAEa5P7Fcsx@`E+"
+    "Y)B>w52Gu#jpg=8v+9Kfxs1>LMuw=pT11~8&2PvFoqlzp};YAy&-%42%Gq#Su|EJnJf`2|<t~4u6^=J@ask-"
+    "~d3_6CH$kF?M#P8wD7fVJ~mN|=SIVTWfKo9vu<R*8T&p@qi;b{Vmo}}%=g>gglfIS6274UZm`_T|!Uf0eTkI0AvLH+m;I%ysso_%"
+    "jVzq6iCzkg!BpqFHOUQtLj0$mmgXOZJ_clTy7+_;+IWuB2c>a|j78{D$cp%j4VaBLJPM{lwMD}K6xtrG<@rxSGfjQM$bLepIYq+m"
+    "><tC?3$K$%$*2*IHQLS<-`Rq5crd5A}r$So#cG6{k-E-"
+    ">$jN0vZN!SFJTF==X^U!~cAU;Lxnx}^7k;djshM=kyS2!_9Trvyc;S?ypjmm2|Zhw%Q>e(Tem{QYl#{P+5EU4rKqxv+V!6Ot*LRL"
+    "z7{aSG(fqRTkC+OT+p*-"
+    "qr4sp+`%<6r)>JX7~^3^8vwOv})rK|CBTWAB#f=zuwUOg=}bUo7KLv9<}^n;YQ<ga)CldN45>XtC?}2t5NpqZe#C;^8$9VMB|U(K"
+    "B(e=AiAlwT2PMVLjS!+;iG=D4-"
+    "|bCd*`bg)Fx<uVo&|&>MowwRW+ScWUsm0V_K*J3U;XS<pE`i_3T)ykpE<q*(#R6!a%>HY?3iW^w=lDphep@7)SUcz!Y?t)jrQ9!K"
+    "+5D0=g<FI}p%`ld&nq}QC86!8vHFY#*T9aS`>uml~;R)I1}Oh=M#A#o8|^)TaMIjS0`McE}>T;Cf-"
+    "!y?7>%rlsc6%S<bx=Nv_AQ54XmbgQPITujz<Y7W6-GlGUn%-"
+    ">MIeq+}uo8Cyrmc7?+MgNbdSg1XW3E1W3tx^I`)K~iN~RZ4i%U=7vMSlVrW3?y_Q9N9`0ax=>`+Ksv}70+PcLk|qgeU8h_w#+0Lz"
+    "^iT{{eL%@TMv7Yse|?2LfEFIWXJD68ar6MjHC6Uf9Jdizp}n<WjeE&<FKU;)iUT7t96dg0mQrX#5J$UxC7Uyh~^u1zWv*%HXk0U-"
+    "^Gpjr4dI>HXvAOs#`8NCn%)EncPQ4RDwn;*X%>aaOB$6g3e08Mn2H<w&|o(YFwmZzI~b(1BtUQ>XxI$Hsciv|YGs@Bx8leG1~I$}"
+    "s!!k42bDw@bufjdE*Twq4M8iw^HeORl;YM~us2U3w!lK|809QcsR+?$a|a})H<z<OSdUYB(vSk~*i?!Ci6^Kf(!n&Ic@o$Gh(!NS"
+    "P9$jrdrmd^DMM~*2cy;^kzdtjRFxR~9OSvp-"
+    "^IM#5=4%QjU`=o}gek?=}8^~QLV)oKU5_=RwnCuCJLEuG$)j2kt4$rK5r+5*n4Wn_YMDT1F^6&n_;qXAVPC`&#biRb3ypl*`hdId"
+    "?^$~iJrVuqocmSO3?a`;NSwA*S)BYK)7_bt?h3m+2dc{%?e&q<{aRM?R82PZPJ%LKRfK<$d*3(&jKy&y2@wuVy1X7_rKAOS@FIB}"
+    "yKS5=!JCIbtxNoA$&VER;J_kF{Fn#Axb;#a(i8@Zd2SZcX;bk1!8g&;VtqI~DDQooiLlX8`MlH4$Sx@n;m#DP-"
+    "Q93NH!pxojTD`>xssp%3a%#Q&ki`5Z1_yyb?2z-4z4sE7e{)D_)LD#}CWw0^r_s+3N6<N)mdxexLwPJ!-"
+    "E#Sidt@;Sw{mgkC`mu}dUskf2YsVgAHqZ5Yye#J`y+6bk=|wOkoOl3?6M`_a0)O!&TutwmpT`e`aA=eBijvF=GPgZESY8i(!b3B<"
+    "IHCRkok2nkBNU0hY4vf$J>f}n3DjHx@TF-"
+    "v2cKeXW7Y*qYTpeh4f^GU5G^YBeEURVu!`BRe;pM(*hf?E)AaYt6Zk^4i`AG45p?Lm0=za<V7+1`*Bo+=6go&EYCq}*Ipw^;Oa*Y"
+    "Li;^vj1=G?$BrV#1d7X$Dq0e3)hvSpJ^D7oJpc+UJ2&|G!GlK~jSql5n@jMyiKe~g(h{Yf{^sCdcSo?Rb88GTcZS8WUFcph<-"
+    "yr|;w2DK<lK?96<WMwKt*ay@BHp09&B`ou%bV?UABRHug7Jb;J`TE^jBHKjF8YQ?$ps7Vxa5UjaqH7`n07-"
+    "O~Ekj=A+UEamZ9JU%|Qb0^LLokubg)A08bo3gia<Pm?k#^+ED1z4HghzioX)#uXnomas<~O8`eJrx;nT^Y8!y1^(|`c%%CQ!R;#w"
+    "0nAH%7q1)dtiH4JjbB#a7+9`qBBv!KO}p$49)67#SRdpp#s`t5TN2z&(#?effwblF9a^21H<qR0iGJl)9R%C-"
+    "UFZW7n=DO$aD76cAH?d#2f5xyShZ)|=pz$PeOf19O2I{XR5ey}>PE*BCbM8OkP@0>xV}J*FF5WVzEtBUn7P^rmyht;-"
+    "gP@!EWH7}7mnh~NURo8+{03!^NDQ7u{AQR)`UQRVtPeuO?W1~nKND9)}>YAw=<P&B3RpB@9ym}OpR)@?UI5l+TOsT5O}r00WGZKR"
+    "^I*lB9DR(94Q|x-Z!El`Eo8;XQ1a$lK@2aaC7G&>wxAae|HRimdv->)Tf@p%sMPG<l>Sl#^JO;t-"
+    "<*?8i)Wi)v)h|;03I(M>^i@+-"
+    "V9vMuoStcy;!Yb{2N`yr1Jqoh<siR6r}ua_X5TdhXspR3_mW^~asg^u(MdZsmZtT`8gPANR1$2TsEUUA5S8pGXj1<*HeR*nM5xsr"
+    "+Ta3M$;s;7@BB;-_<4;gOP4ZATs|M?G|To=z5z+&zN*c>i2Qm~hWOm=fs}9tZTx)3wJm=e({&(ExWXGn#sK+(KAa-"
+    "PGogIX&c=+1JWbL%N8vK66Y#>~g;oc|W0{>*1%~Dc1|squ+PM8-myLx)7h@{mQz>r|nbxd-HRCH7W5Bt>Xr+s4H(gP<@%#Kb#G;P"
+    "00EDBXo>B9s@#;)k>+BvAq_o1aKX~8s#gzsHsmEnn8QDsT4Qa!HO1CA=aCYxbpy80Ok;0No+({>)x8c&1ddJTO{010`yH?pF@I|z"
+    "&@+#{PV2p3WWL~)vW}TS2W0<cIWJ&o!Pgabb8L)$-"
+    "AW+ES)o$eO9BKy#m~ezdo)R@mYd?`xoKaEKP=&4n*mBeE4}?BI=UX*2y91aEENjS0L|&G)-"
+    "X=!;3R%j*>4xtOGnuJ{SCEJi}F4t5(}#nbqkarV{TtyzeEK%t$P1;^w9o_51E~)!ioSDx@dJ{p6U1a7P5O$K)+pip)TOc?#G$k1e"
+    "-;!=2i~r!-Aza4(5U&E`F)9#vlbtB{8v$>V`}DLp#{Aus`R$ziLdPW~m7q<qUF1y(gTYdV;)>BGS2>iNP-"
+    "2DD^d<&R%x&#HDH#3#u|>=JP|_O3t8GH^HPjl$%N@s;*MvDeMs)~gpA0r+K|9Ic)lKM(%fEsiRfo<Y>Dg1gtceCpwoZaKbyJu>ex"
+    "*qWP|wiZrGv}T&3o2#((4$)ROS8(7o&v<MqgEAvZaGMSkFG??`ra>!EA48;J{ZFSE#hJQWH;k=3#8$(wa1FWk#p-w=wYo$D9;z-"
+    "?S2WYEVHH+`3vM&eNm_bcADsL^Bizz_!R)>;rzmLm#z66~M7vHIO>~!87TAMkSuihJcZXro+tyWEb7-"
+    "lmk{Vfgi{%~cs+DkCNGq6eaI9qx$)mTo_KjWJjNvsfG`Z0t7e9zdNrjs+<L`d+cPY3!xtPmSz#8+Q&RnRR5A)B7dFO>QH;nnAUur"
+    "Ys;_~~QCG!P>)|HMQE+W)bSnDwEJ*7j#eDgDshq5v=7S{uqgSfWt(8B1&3d=;l^oDZ=bFK@{IpjOtZ;q~gn8gdw;oz7HE8h5#F|("
+    "jTm*a?6KP-YMhm81g(2L#1j^~hI^hGa@cuaMs%XBmyixl4SE8YypT868yAWchv*NWmb3hX3t6Yg<F18wkKxnYRGSAckX64C&akrC"
+    "R`Q4CZ<;wUOm>;)Ok4b5C7jtZt>t8Q=59UOnK)|4II0`JHMl~3$<SxJsK7G2`Mn`Zg|IU0`zeIAQib1cZkIlUey1;hH(D-"
+    "mj^0Hpw6kZr=ONCI;_I|55M*MroUgW4A&=_}v?ZOxwL&br4(U1Gzr42CnVW>#!BR}Icx^HiZEsEgPl(wx(X!XFr1Y77$RM?OX?lI"
+    "w`%zIze$c!S6c?;9vFGaQ=l{?Lko<>}Tfhn-WIoTr865uQg_;Z8E1Nlnbvf{imNDW5QE6kEWp3y%@?#Dj{!r$I-"
+    "Cg2KQ&#c)vD<{=^1HF&tByT|KOG;C_zpyHqc23|Ah+knSR6zg?vQdzHOpjcnvCKV6sEt>trf>ZM%m8e8}ry4o{Gd|%<H9T0mIrH{"
+    "(fH9-"
+    "W6T1pK`D4AIy=yLE%V2*EMEAgT41P9eh(;Mkq(=TeuYB>zjr+Oa^<og!IVpr<^Boj^z0>VLy2gAQ!qN5+N5jnQ>ms|KfTguB>hnX"
+    "2JRC+W<pv!d##!J6fHcsQPur&$4(WJBZk{Wt2mZeFh6!{w!b7_ia$XcXz2FL^`h{lnZgbeL_Kz823@o~JY>)}<Y<?b%Ml0mvDo)`"
+    "4`E?&ye1(4t^2;-@-j89o4(nA66DzQN<#99+GP~@i)$pg+zF-&d2&9{3#p1Mw-"
+    "KqGFUY@0&kw*H~%tit>m@#)(XfJ-h!6Ym|sZGRYTPJ|K+txkBmUvA^tngJP67FCAh{dwp%q8Ij43Z@T_>I!uuQP-dZ{{X9u7{p0_"
+    "w$VW&kH1UwoZ|(M`^NHIEO!-"
+    "jC6mliHF4_7BnDqI(j2A=F7R7l?$#95PeYE)|bA!0Op!0wP%YJc{5|i8297QvK1HPuoa2}AJzvx^v$SQjA|IvKGrn-"
+    "P6%(sGJ5AogT@2$;}3se|B<69>^&gSE4w&NefatO*Jw~#+RGWHQeV+bmM|A`=3b*7(Ubyi2La?-"
+    "n@o$%@Di^y?pU(Az?Z=~OO*xl08(Wc78EP;Y3b(K{@%{*kAM2%$3OkYNA=&IOVX6d9{tgrWPktL|NehuoB1x<JmUO8?OEXe^J62}"
+    "|8k?%U}e_ly?2e~3J*#cb_Jc1<m%m~DS9-Z9^s)zNMNL-2@TyNIUEj03_iN$-"
+    ")Jq})(KGZw;<vQ;Pg2j#{CdIa%n?X5Yb1QaK%ewCfpsEnS{<oR0qIn$Y$yJA``V)vpGBw*bt{Jc5{<H9-"
+    "`H2PB6mK&f)9c;mNBq)yKu8S(oZBw_bE#9dF$ppTlMaDIF4Mj6h@T@(gYVrC<65^HSlFII9ach7PqNEhS|BKqG6E!D2S%Z3rjk`3"
+    "GDE_%7}3zv%7k9&J6_>+aO28zFlsJq<-}6h<b}N>T!8mT8n4YDeeoMcG_~PBDDGyVrF(>4)-"
+    "{k4>We)t56<`fh;ku?g1rqm!2}w+>%#FeQnE6Yyhy2d35{0!AwrTVTlFr0yuXYO$4_O>xsp4#F%)uKoFG7HlIAYU<Jh5}Xwv(NRg"
+    "|nsOgbbqT!zC|1lGB=3U&HW2}ABFs$`7YgpCEI*Hjh4JRI&lJ3CfOjoy4B~I=<aodLx_dM)uuA|2iC<13me~aOP51EG{!w>ccrm~"
+    "O-3#Km`vq7#;AtA0fOlU(_|Mk%@$NU>-pTH~@XrAvSWYG;%xMm${n9!?3I-"
+    "z!35*0=k&$2_>As?ZrnkLy+<mcsxZ6GAX1XU$7d!H#ysaEG=^1SueZ6~daQC(zwf&cL;;h}dJxMMS3^q$A=ywG&Yu$erC!5un&z2"
+    "FE?gc45>A7q+rhZ$iRwX#;)PjyQ#Na-;euHiMACO(e2w+kxKry_EzYnuP1LeEP2bzQ*h0~;e-qW}U;#C{CcIdK#IZ+9-BbpX-"
+    "^0Sc=EHt6u8}O~YJ#DO6To=6FKRDifWq**e#A{pyN85r%4l_}Dblg2SQoBp~$lasF5GaDZ#5A2h!`)gvit5Yh-bojjm@)3hxU*8Y"
+    "%RLl#4n>V^2fcfEGDNYTx_r92W^SJpjE_&PXf_O4#rI5pHCZbul+VBa?T3GtIxbv})}>@aPiGnvBCgJKm0Tu5jvxjX6Ukk0DaYMA"
+    "wT7sRiCsX(<tcb<W6)7s15|TXaPzQ2_arN9s~}yE8&ZRk+7lmlI=*lko1y;*)r{ByH{Pc+Md8f}1F*KHplx5%)NEqSZ(_GlCC9^7"
+    "AuBk#WC+3(C3wz{ahR()xFuaBm{U%?PP55*C<_hHlg)g^{fXHT5P$b?;G2+yBmOi57vBj4Eg4TeJa@2O=^!xJj@@1DM5OT-"
+    "eIP#GIW7tmpi-VDKwkL*&p1?WIZWM{Uyo__MgfA}kj*a#cW-"
+    "ufF0Qn0BQdT8D2X}n=1DJ0Y3)md=kd!nJjgUJ1N%VE3gq-B20<Qq4k4tl`)9@((@17WSYdhmKSB-(W)j)Gf1xJ9{|9);3e5"
 )
 
-# Opt-in only categories (use --only <cat> to run)
-OPTIN_CATEGORIES=(pacnew foreign-packages deep-orphans stale-procs tmpfiles-clean locale-purge docker snap kde-cache)
 
-# ─── Functions ───────────────────────────────────────────────────────
+_CORE_TEMPFILE = None
 
-usage() {
-    echo -e "${BOLD}sclean${RESET} — Deep System Cleanup Tool v3.0"
-    echo ""
-    echo -e "${BOLD}Usage:${RESET} sclean [OPTIONS]"
-    echo ""
-    echo -e "${BOLD}Options:${RESET}"
-    echo "  -n, --dry-run       Show what would be cleaned without deleting"
-    echo "  -y, --yes           Skip all confirmation prompts"
-    echo "  -v, --verbose       Show detailed output"
-    echo "  -i, --interactive   Launch interactive UI wizard"
-    echo "      --ui            Alias for --interactive"
-    echo "  -h, --help          Show this help message"
-    echo ""
-    echo -e "${BOLD}Category Filters:${RESET}"
-    echo "  --only <cat,...>    Run ONLY specified categories"
-    echo "  --skip <cat,...>    Skip specified categories"
-    echo ""
-    echo -e "${BOLD}Available Categories:${RESET}"
-    echo "  pacman          Corrupted/interrupted pacman downloads"
-    echo "  orphans         Orphaned packages (unneeded dependencies)"
-    echo "  deep-orphans    Extra orphan scan incl. optional deps (opt-in)"
-    echo "  cache           Package cache (pacman + yay)"
-    echo "  journal         Old systemd journal logs"
-    echo "  flatpak         Unused Flatpak runtimes"
-    echo "  flatpak-data    Orphaned Flatpak app data in ~/.var/app"
-    echo "  flatpak-cache   Flatpak cache/temp directories"
-    echo "  temp-files      Old files in /tmp and /var/tmp"
-    echo "  coredumps       Systemd coredumps"
-    echo "  thumbnails      Thumbnail cache"
-    echo "  trash           Trash bin contents"
-    echo "  broken-symlinks Broken symbolic links in home"
-    echo "  crash-reports   Electron/Chromium crash reports"
-    echo "  mesa-shader     Mesa/GPU shader cache"
-    echo "  dev-caches      Developer tool caches (npm, pip, go, cargo, etc.)"
-    echo "  old-logs        Rotated old log files in /var/log"
-    echo "  pacnew          List .pacnew/.pacsave files (opt-in, info only)"
-    echo "  foreign-packages List manually installed AUR or dropped packages (opt-in, info only)"
+def _extract_core():
+    """Extract the embedded sclean bash script to a temp file."""
+    global _CORE_TEMPFILE
+    if _CORE_TEMPFILE and os.path.isfile(_CORE_TEMPFILE):
+        return _CORE_TEMPFILE
+    data = zlib.decompress(base64.b85decode(_CORE_B85))
+    fd, path = tempfile.mkstemp(prefix="sclean-core-", suffix=".sh")
+    os.write(fd, data)
+    os.close(fd)
+    os.chmod(path, 0o755)
+    _CORE_TEMPFILE = path
+    atexit.register(lambda: os.unlink(path) if os.path.exists(path) else None)
+    return path
 
-    echo "  stale-procs     Kill stale user processes with deleted binaries (opt-in)"
-    echo "  systemd-failed  Reset failed systemd units"
-    echo "  service-leftovers Clean broken/not-found systemd links/units"
-    echo "  browser-cache   Browser cache data"
-    echo "  locale-purge    Clean unused locale/translation files (opt-in)"
-    echo "  docker          Prune containers, images, volumes & build cache (opt-in)"
-    echo "  snap            Remove old snap revisions (keeps current) (opt-in)"
-    echo "  kde-cache       Clean KDE/Plasma offline caches (opt-in)"
-    echo "  tmpfiles-clean  Run systemd-tmpfiles aging rules (opt-in)"
-    echo ""
-    echo -e "${BOLD}Examples:${RESET}"
-    echo "  sclean                     # Full cleanup with prompts"
-    echo "  sclean -n                  # Dry run, show what would happen"
-    echo "  sclean -y                  # Auto-confirm everything"
-    echo "  sclean --only cache,journal,coredumps"
-    echo "  sclean --only deep-orphans -n"
+def _find_sclean_core():
+    """Find sclean-core: prefer system-installed, fall back to embedded."""
+    for p in [
+        os.path.expanduser("~/.local/bin/sclean-core"),
+        shutil.which("sclean-core") or "",
+    ]:
+        if p and os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    # Fall back to embedded copy
+    return _extract_core()
 
-    echo "  sclean --only stale-procs -n"
-    echo "  sclean --skip flatpak,dev-caches"
-    exit 0
-}
+SCLEAN = None  # Resolved lazily at startup
 
-array_contains() {
-    local needle="$1"
-    shift
-    local item
-    for item in "$@"; do
-        [[ "$item" == "$needle" ]] && return 0
-    done
-    return 1
-}
+# ─────────────────────────────────────────────────────────
+#  CATEGORIES (matches sclean's function call order)
+# ─────────────────────────────────────────────────────────
 
-is_optin_category() {
-    local cat="$1"
-    local opt
-    for opt in "${OPTIN_CATEGORIES[@]}"; do
-        [[ "$opt" == "$cat" ]] && return 0
-    done
-    return 1
-}
+CATEGORIES = [
+    ("pacman",           "Pacman Downloads",  "Corrupted/partial downloads",       False),
+    ("orphans",          "Orphan Packages",   "Unneeded dependencies",             False),
+    ("cache",            "Package Cache",     "Pacman + AUR cache",                False),
+    ("journal",          "System Journal",    "Old systemd journal logs",          False),
+    ("flatpak",          "Flatpak Runtimes",  "Unused runtimes",                   False),
+    ("flatpak-data",     "Flatpak Data",      "Orphaned app data",                 False),
+    ("flatpak-cache",    "Flatpak Cache",     "Flatpak temp/cache dirs",           False),
+    ("temp-files",       "Temp Files",        "/tmp and /var/tmp",                 False),
+    ("user-cache",       "User Cache",        "~/.cache old files",                False),
+    ("coredumps",        "Core Dumps",        "Systemd coredumps",                 False),
+    ("thumbnails",       "Thumbnails",        "Thumbnail cache",                   False),
+    ("trash",            "Trash",             "Trash bin contents",                False),
+    ("broken-symlinks",  "Broken Symlinks",   "Broken links in home",              False),
+    ("crash-reports",    "Crash Reports",     "Electron/Chromium crashes",          False),
+    ("mesa-shader",      "Shader Cache",      "Mesa/GPU shaders",                  False),
+    ("dev-caches",       "Dev Caches",        "npm, pip, go, cargo, etc.",          False),
+    ("old-logs",         "Old Logs",          "Rotated logs in /var/log",           False),
+    ("systemd-failed",   "Failed Units",      "Reset failed systemd units",         False),
+    ("service-leftovers","Service Leftovers", "Broken systemd entries",             False),
+    ("browser-cache",    "Browser Cache",     "Browser cache data",                False),
+    # ── Opt-in ──
+    ("deep-orphans",     "Deep Orphans",      "Incl. optional deps",               True),
+    ("pacnew",           "Pacnew Files",      ".pacnew/.pacsave (info only)",       True),
+    ("foreign-packages", "Foreign Packages",  "AUR/manual packages (info only)",    True),
+    ("locale-purge",     "Locale Purge",      "Unused locale/translations",         True),
+    ("docker",           "Docker",            "Prune containers/images/volumes",    True),
+    ("snap",             "Snap",              "Old snap revisions",                 True),
+    ("kde-cache",        "KDE Cache",         "KDE/Plasma offline caches",          True),
+    ("tmpfiles-clean",   "Tmpfiles",          "systemd-tmpfiles aging rules",       True),
+    ("stale-procs",      "Stale Processes",   "Processes with deleted binaries",    True),
+]
 
-category_description() {
-    case "$1" in
-        pacman) echo "Corrupted/interrupted pacman downloads" ;;
-        orphans) echo "Orphaned packages (unneeded dependencies)" ;;
-        deep-orphans) echo "Extra orphan scan including optional deps" ;;
-        cache) echo "Package cache (pacman + yay)" ;;
-        journal) echo "Old systemd journal logs" ;;
-        flatpak) echo "Unused Flatpak runtimes" ;;
-        flatpak-data) echo "Orphaned Flatpak app data" ;;
-        flatpak-cache) echo "Flatpak cache/temp directories" ;;
-        temp-files) echo "Old files in /tmp and /var/tmp" ;;
-        user-cache) echo "Old files in ~/.cache and config backups" ;;
-        coredumps) echo "Systemd coredumps" ;;
-        thumbnails) echo "Thumbnail cache" ;;
-        trash) echo "Trash bin contents" ;;
-        broken-symlinks) echo "Broken symbolic links in home" ;;
-        crash-reports) echo "Electron/Chromium crash reports" ;;
-        mesa-shader) echo "Mesa/GPU shader cache" ;;
-        dev-caches) echo "Developer tool caches" ;;
-        old-logs) echo "Rotated/compressed logs in /var/log" ;;
-        pacnew) echo "List .pacnew/.pacsave files (info only)" ;;
-        foreign-packages) echo "Installed foreign/AUR packages (info only)" ;;
+# Execution order in sclean (matches function call order in the script)
+EXEC_ORDER = [c[0] for c in CATEGORIES]
+CAT_LABEL = {c[0]: c[1] for c in CATEGORIES}
+CAT_DESC = {c[0]: c[2] for c in CATEGORIES}
+OPTIN_START = next(i for i, c in enumerate(CATEGORIES) if c[3])
 
-        stale-procs) echo "Kill stale user processes with deleted binaries" ;;
-        systemd-failed) echo "Reset failed systemd units" ;;
-        service-leftovers) echo "Clean broken/not-found systemd entries" ;;
-        browser-cache) echo "Browser cache data" ;;
-        locale-purge) echo "Clean unused locale/translation files" ;;
-        docker) echo "Prune containers, images, volumes & build cache" ;;
-        snap) echo "Remove old snap revisions" ;;
-        kde-cache) echo "Clean KDE/Plasma runtime caches" ;;
-        tmpfiles-clean) echo "Run systemd-tmpfiles aging rules" ;;
-        *) echo "Cleanup category" ;;
-    esac
-}
+# ─────────────────────────────────────────────────────────
+#  COLORS
+# ─────────────────────────────────────────────────────────
 
-show_ui_header() {
-    echo -e "${BLUE}"
-    echo "╔══════════════════════════════════════════════════════════╗"
-    echo "║            sclean Interactive Setup Wizard              ║"
-    echo "╚══════════════════════════════════════════════════════════╝"
-    echo -e "${RESET}"
-}
+C_BORDER = 1
+C_TEXT = 2
+C_DIM = 3
+C_HIGHLIGHT = 4
+C_GREEN = 5
+C_RED = 6
+C_YELLOW = 7
+C_BAR = 8
+C_ACCENT = 9
 
-pick_execution_mode() {
-    while true; do
-        clear
-        show_ui_header
-        echo "Choose execution mode:"
-        echo "  1) Guided cleanup (prompts before destructive actions)"
-        echo "  2) Dry run only (preview without deleting)"
-        echo "  3) Auto-confirm cleanup (no prompts)"
-        echo "  4) Dry run + auto-confirm"
-        echo "  5) Cancel"
-        echo ""
-        read -r -p "Mode [1-5]: " mode_choice
 
-        case "$mode_choice" in
-            1)
-                DRY_RUN=false
-                AUTO_YES=false
-                return 0
-                ;;
-            2)
-                DRY_RUN=true
-                AUTO_YES=false
-                return 0
-                ;;
-            3)
-                DRY_RUN=false
-                AUTO_YES=true
-                return 0
-                ;;
-            4)
-                DRY_RUN=true
-                AUTO_YES=true
-                return 0
-                ;;
-            5)
-                return 1
-                ;;
-            *)
-                echo -e "${RED}Invalid selection.${RESET}"
-                read -r -p "Press Enter to try again..." _
-                ;;
-        esac
-    done
-}
+def init_colors():
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+        bg = -1
+    except curses.error:
+        bg = curses.COLOR_BLACK
+    curses.init_pair(C_BORDER, curses.COLOR_CYAN, bg)
+    curses.init_pair(C_TEXT, curses.COLOR_WHITE, bg)
+    curses.init_pair(C_DIM, curses.COLOR_WHITE, bg)       # used with A_DIM
+    curses.init_pair(C_HIGHLIGHT, curses.COLOR_BLACK, curses.COLOR_CYAN)
+    curses.init_pair(C_GREEN, curses.COLOR_GREEN, bg)
+    curses.init_pair(C_RED, curses.COLOR_RED, bg)
+    curses.init_pair(C_YELLOW, curses.COLOR_YELLOW, bg)
+    curses.init_pair(C_BAR, curses.COLOR_GREEN, bg)
+    curses.init_pair(C_ACCENT, curses.COLOR_MAGENTA, bg)
 
-pick_categories_custom() {
-    local categories=("${ALL_CATEGORIES[@]}" "${OPTIN_CATEGORIES[@]}")
-    local selected=()
-    local cat
-    for cat in "${categories[@]}"; do
-        if array_contains "$cat" "${ALL_CATEGORIES[@]}"; then
-            selected+=(1)
-        else
-            selected+=(0)
-        fi
-    done
 
-    while true; do
-        clear
-        show_ui_header
-        echo "Custom category selection:"
-        echo ""
+# ─────────────────────────────────────────────────────────
+#  DRAWING HELPERS
+# ─────────────────────────────────────────────────────────
 
-        local idx=1
-        local total_selected=0
-        local mark desc opt_tag
-        for cat in "${categories[@]}"; do
-            if (( selected[idx-1] == 1 )); then
-                mark="x"
-                total_selected=$((total_selected + 1))
-            else
-                mark=" "
-            fi
-            desc=$(category_description "$cat")
-            opt_tag=""
-            is_optin_category "$cat" && opt_tag=" (opt-in)"
-            printf "  %2d) [%s] %-17s %s%s\n" "$idx" "$mark" "$cat" "$desc" "$opt_tag"
-            idx=$((idx + 1))
-        done
+def put(scr, y, x, s, attr=0):
+    h, w = scr.getmaxyx()
+    if y < 0 or y >= h or x >= w:
+        return
+    if x < 0:
+        s = s[-x:]
+        x = 0
+    try:
+        scr.addstr(y, x, s[:w - x], attr)
+    except curses.error:
+        pass
 
-        echo ""
-        echo "Selected: $total_selected/${#categories[@]}"
-        echo "Commands:"
-        echo "  <numbers>  Toggle one or more (example: 1 4 9 or 1,4,9)"
-        echo "  a          Select all categories"
-        echo "  d          Select recommended defaults"
-        echo "  o          Select opt-in only"
-        echo "  n          Select none"
-        echo "  r          Run with selected categories"
-        echo "  q          Cancel"
-        echo ""
-        read -r -p "Input: " input
 
-        case "$input" in
-            a|A)
-                local i
-                for (( i=0; i<${#selected[@]}; i++ )); do
-                    selected[i]=1
-                done
-                ;;
-            d|D)
-                local i
-                for (( i=0; i<${#categories[@]}; i++ )); do
-                    if array_contains "${categories[i]}" "${ALL_CATEGORIES[@]}"; then
-                        selected[i]=1
-                    else
-                        selected[i]=0
-                    fi
-                done
-                ;;
-            o|O)
-                local i
-                for (( i=0; i<${#categories[@]}; i++ )); do
-                    if is_optin_category "${categories[i]}"; then
-                        selected[i]=1
-                    else
-                        selected[i]=0
-                    fi
-                done
-                ;;
-            n|N)
-                local i
-                for (( i=0; i<${#selected[@]}; i++ )); do
-                    selected[i]=0
-                done
-                ;;
-            r|R)
-                ENABLED_CATEGORIES=()
-                local i
-                for (( i=0; i<${#categories[@]}; i++ )); do
-                    (( selected[i] == 1 )) && ENABLED_CATEGORIES+=("${categories[i]}")
-                done
-                if (( ${#ENABLED_CATEGORIES[@]} == 0 )); then
-                    echo -e "${RED}Select at least one category before running.${RESET}"
-                    read -r -p "Press Enter to continue..." _
-                else
-                    SKIPPED_CATEGORIES=()
-                    return 0
-                fi
-                ;;
-            q|Q)
-                return 1
-                ;;
-            *)
-                local token changed=false
-                for token in ${input//,/ }; do
-                    if [[ "$token" =~ ^[0-9]+$ ]]; then
-                        local pos=$((token - 1))
-                        if (( pos >= 0 && pos < ${#categories[@]} )); then
-                            if (( selected[pos] == 1 )); then
-                                selected[pos]=0
-                            else
-                                selected[pos]=1
-                            fi
-                            changed=true
-                        fi
-                    fi
-                done
-                if ! $changed; then
-                    echo -e "${RED}No valid input detected.${RESET}"
-                    read -r -p "Press Enter to continue..." _
-                fi
-                ;;
-        esac
-    done
-}
+def hline(scr, y, x, width, attr=0):
+    put(scr, y, x, "─" * width, attr)
 
-pick_category_preset() {
-    while true; do
-        clear
-        show_ui_header
-        echo "Choose category profile:"
-        echo "  1) Recommended defaults (${#ALL_CATEGORIES[@]} categories)"
-        echo "  2) Everything (${#ALL_CATEGORIES[@]} defaults + ${#OPTIN_CATEGORIES[@]} opt-in)"
-        echo "  3) Safe quick run (cache,journal,temp-files,user-cache,trash,thumbnails,browser-cache)"
-        echo "  4) Custom selection"
-        echo "  5) Cancel"
-        echo ""
-        read -r -p "Profile [1-5]: " profile_choice
 
-        case "$profile_choice" in
-            1)
-                ENABLED_CATEGORIES=("${ALL_CATEGORIES[@]}")
-                SKIPPED_CATEGORIES=()
-                return 0
-                ;;
-            2)
-                ENABLED_CATEGORIES=("${ALL_CATEGORIES[@]}" "${OPTIN_CATEGORIES[@]}")
-                SKIPPED_CATEGORIES=()
-                return 0
-                ;;
-            3)
-                ENABLED_CATEGORIES=(
-                    cache journal temp-files trash thumbnails browser-cache
-                )
-                SKIPPED_CATEGORIES=()
-                return 0
-                ;;
-            4)
-                pick_categories_custom && return 0
-                ;;
-            5)
-                return 1
-                ;;
-            *)
-                echo -e "${RED}Invalid selection.${RESET}"
-                read -r -p "Press Enter to try again..." _
-                ;;
-        esac
-    done
-}
+def disk_info():
+    try:
+        st = os.statvfs("/")
+        total = st.f_blocks * st.f_frsize
+        free = st.f_bavail * st.f_frsize
+        used = total - free
+        pct = used / total * 100 if total > 0 else 0
+        return {"total": total, "used": used, "free": free, "pct": pct}
+    except OSError:
+        return {"total": 0, "used": 0, "free": 0, "pct": 0}
 
-show_ui_plan_and_confirm() {
-    while true; do
-        clear
-        show_ui_header
-        init_log_file
-        local mode_label="Guided cleanup"
-        $DRY_RUN && mode_label="Dry run"
-        $AUTO_YES && mode_label="${mode_label} + auto-confirm"
 
-        echo -e "${BOLD}Execution plan${RESET}"
-        echo "  Mode: $mode_label"
-        echo "  Categories selected: ${#ENABLED_CATEGORIES[@]}"
-        if $LOG_DISABLED; then
-            echo "  Log file: disabled (no writable path)"
-        else
-            echo "  Log file: $LOG_FILE"
-        fi
-        echo ""
-        local cat
-        for cat in "${ENABLED_CATEGORIES[@]}"; do
-            local opt_tag=""
-            is_optin_category "$cat" && opt_tag=" (opt-in)"
-            echo "  - $cat$opt_tag"
-        done
-        echo ""
-        read -r -p "Start cleanup now? [Y/n]: " start_answer
+def human(n):
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {u}"
+        n /= 1024
+    return f"{n:.1f} PB"
 
-        if [[ -z "$start_answer" || "$start_answer" =~ ^[Yy] ]]; then
-            return 0
-        fi
 
-        read -r -p "Edit setup (e), cancel (c), or start anyway (s)? [e/c/s]: " next_step
-        case "$next_step" in
-            s|S) return 0 ;;
-            c|C) return 1 ;;
-            e|E|*) return 2 ;;
-        esac
-    done
-}
+def draw_bar(scr, y, x, width, pct, color_pair):
+    """Draw a usage bar. pct is 0-100."""
+    filled = int(pct / 100 * width)
+    put(scr, y, x, "█" * filled, curses.color_pair(color_pair) | curses.A_BOLD)
+    put(scr, y, x + filled, "░" * (width - filled), curses.color_pair(C_DIM) | curses.A_DIM)
 
-launch_interactive_ui() {
-    if [[ ! -t 0 || ! -t 1 ]]; then
-        echo -e "${RED}Interactive mode requires a terminal (TTY).${RESET}"
-        exit 1
-    fi
 
-    while true; do
-        pick_execution_mode || {
-            echo -e "${DIM}Cancelled.${RESET}"
-            exit 0
-        }
+def bar_color(pct):
+    if pct > 90:
+        return C_RED
+    elif pct > 75:
+        return C_YELLOW
+    return C_GREEN
 
-        pick_category_preset || {
-            echo -e "${DIM}Cancelled.${RESET}"
-            exit 0
-        }
 
-        show_ui_plan_and_confirm
-        local plan_status=$?
-        case "$plan_status" in
-            0) return 0 ;;
-            1)
-                echo -e "${DIM}Cancelled.${RESET}"
-                exit 0
-                ;;
-            2) ;;
-        esac
-    done
-}
+def draw_header(scr, title_extra=""):
+    _, w = scr.getmaxyx()
+    d = disk_info()
+    title = f"  sclean{title_extra}"
+    disk_str = f"{human(d['used'])} / {human(d['total'])} ({d['pct']:.0f}%)  "
 
-log() {
-    local msg="$1"
-    init_log_file
-    $LOG_DISABLED && return 0
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $msg" >> "$LOG_FILE"
-}
+    put(scr, 0, 0, title, curses.color_pair(C_BORDER) | curses.A_BOLD)
+    put(scr, 0, w - len(disk_str), disk_str, curses.color_pair(C_DIM) | curses.A_DIM)
+    hline(scr, 1, 0, w, curses.color_pair(C_BORDER))
 
-init_log_file() {
-    $LOG_READY && return 0
+    # Disk bar
+    bar_w = min(w - 24, 50)
+    draw_bar(scr, 2, 2, bar_w, d['pct'], bar_color(d['pct']))
+    put(scr, 2, bar_w + 4, f"{human(d['free'])} free",
+        curses.color_pair(C_DIM) | curses.A_DIM)
 
-    local log_dir
-    log_dir="$(dirname "$LOG_FILE")"
-    mkdir -p "$log_dir" 2>/dev/null || true
 
-    if ! { : >> "$LOG_FILE"; } 2>/dev/null; then
-        LOG_FILE="${TMPDIR:-/tmp}/sclean/cleanup-$(date +%Y%m%d-%H%M%S).log"
-        log_dir="$(dirname "$LOG_FILE")"
-        mkdir -p "$log_dir" 2>/dev/null || true
+def draw_footer(scr, text):
+    h, w = scr.getmaxyx()
+    hline(scr, h - 2, 0, w, curses.color_pair(C_BORDER))
+    put(scr, h - 1, 2, text[:w - 4], curses.color_pair(C_DIM) | curses.A_DIM)
 
-        if ! { : >> "$LOG_FILE"; } 2>/dev/null; then
-            LOG_DISABLED=true
-        fi
-    fi
 
-    LOG_READY=true
-}
+# ─────────────────────────────────────────────────────────
+#  SUDO PRE-AUTH (runs before curses)
+# ─────────────────────────────────────────────────────────
 
-get_dir_size() {
-    # Returns size in KB
-    local path="$1"
-    if [[ -e "$path" ]]; then
-        du -sk "$path" 2>/dev/null | awk '{print $1}'
-    else
-        echo 0
-    fi
-}
+def ensure_sudo():
+    if os.geteuid() == 0:
+        return True
+    print()
+    print("  ┌─────────────────────────────────────────┐")
+    print("  │  sclean — System Cleanup                │")
+    print("  │                                         │")
+    print("  │  Some operations require root access.   │")
+    print("  │  You may be prompted for your password. │")
+    print("  └─────────────────────────────────────────┘")
+    print()
+    result = subprocess.run(["sudo", "-v"])
+    if result.returncode != 0:
+        print("  Could not authenticate. Continuing with limited access.\n")
+        time.sleep(1)
+        return False
+    print("  ✓ Authenticated.\n")
+    time.sleep(0.3)
 
-get_dir_size_human() {
-    local path="$1"
-    if [[ -e "$path" ]]; then
-        du -sh "$path" 2>/dev/null | awk '{print $1}'
-    else
-        echo "0K"
-    fi
-}
+    # Keep sudo alive in background
+    def keepalive():
+        while True:
+            time.sleep(55)
+            subprocess.run(["sudo", "-v"], capture_output=True)
+    threading.Thread(target=keepalive, daemon=True).start()
+    return True
 
-track_freed() {
-    local before_kb="$1"
-    local after_kb="$2"
-    local freed=$((before_kb - after_kb))
-    if (( freed > 0 )); then
-        TOTAL_FREED=$((TOTAL_FREED + freed))
-        local freed_human
-        freed_human=$(numfmt --to=iec --from-unit=1024 "$freed" 2>/dev/null || echo "${freed}K")
-        echo -e "   ${GREEN}↳ Freed: ${freed_human}${RESET}"
-        log "Freed: ${freed_human}"
-    fi
-}
 
-human_size() {
-    numfmt --to=iec --from-unit=1024 "$1" 2>/dev/null || echo "${1}K"
-}
+# ─────────────────────────────────────────────────────────
+#  SCREEN 1: CATEGORY SELECTION
+# ─────────────────────────────────────────────────────────
 
-remove_packages() {
-    local package_list="$1"
-    [[ -z "$package_list" ]] && return 0
+def screen_select(scr):
+    """Returns (selected_cat_ids, dry_run) or (None, False) if quit."""
+    selected = [not c[3] for c in CATEGORIES]  # defaults: all non-optin
+    cursor = 0
+    scroll = 0
+    dry_run = False
 
-    if command -v yay &>/dev/null; then
-        echo "$package_list" | yay -Rns - --noconfirm 2>/dev/null
-    else
-        echo "$package_list" | sudo pacman -Rns - --noconfirm 2>/dev/null
-    fi
-}
+    while True:
+        h, w = scr.getmaxyx()
+        scr.erase()
+        draw_header(scr)
 
-confirm() {
-    if $AUTO_YES; then
+        # Section title
+        sel_count = sum(selected)
+        put(scr, 4, 2, "Select categories",
+            curses.color_pair(C_TEXT) | curses.A_BOLD)
+        counter = f"{sel_count} of {len(CATEGORIES)} selected"
+        put(scr, 4, w - len(counter) - 2, counter,
+            curses.color_pair(C_BORDER))
+
+        # List area
+        list_y = 6
+        list_h = h - 10  # room for header (5) + footer (3) + dry-run (2)
+
+        # Scroll
+        if cursor < scroll:
+            scroll = cursor
+        if cursor >= scroll + list_h:
+            scroll = cursor - list_h + 1
+
+        for vi in range(list_h):
+            i = scroll + vi
+            if i >= len(CATEGORIES):
+                break
+
+            cat_id, label, desc, optin = CATEGORIES[i]
+            y = list_y + vi
+
+            # Opt-in separator
+            if i == OPTIN_START and i == scroll + vi:
+                if vi > 0:
+                    put(scr, y, 2, "── opt-in ", curses.color_pair(C_ACCENT))
+                    hline(scr, y, 12, w - 14, curses.color_pair(C_ACCENT) | curses.A_DIM)
+                    continue
+
+            is_cur = (i == cursor)
+
+            # Build the row
+            check = "✓" if selected[i] else " "
+            arrow = "▸" if is_cur else " "
+
+            if is_cur:
+                # Highlighted row
+                row_attr = curses.color_pair(C_HIGHLIGHT)
+                put(scr, y, 1, " " * (w - 2), row_attr)
+                put(scr, y, 2, f" [{check}]  {label:<20s}{desc}", row_attr)
+            else:
+                # Normal row
+                put(scr, y, 2, arrow, curses.color_pair(C_BORDER))
+                check_attr = curses.color_pair(C_GREEN) | curses.A_BOLD if selected[i] else curses.color_pair(C_DIM) | curses.A_DIM
+                put(scr, y, 4, f"[{check}]", check_attr)
+                label_attr = curses.color_pair(C_TEXT) if not optin else curses.color_pair(C_ACCENT)
+                put(scr, y, 10, f"{label:<20s}", label_attr)
+                put(scr, y, 30, desc[:w - 32], curses.color_pair(C_DIM) | curses.A_DIM)
+
+        # Scroll indicators
+        if scroll > 0:
+            put(scr, list_y, w - 1, "▲", curses.color_pair(C_BORDER))
+        if scroll + list_h < len(CATEGORIES):
+            put(scr, list_y + list_h - 1, w - 1, "▼", curses.color_pair(C_BORDER))
+
+        # Dry run toggle
+        dr_y = h - 4
+        dr_check = "✓" if dry_run else " "
+        dr_attr = curses.color_pair(C_YELLOW) | curses.A_BOLD if dry_run else curses.color_pair(C_DIM) | curses.A_DIM
+        put(scr, dr_y, 2, f"  [{dr_check}]  Dry run — preview only, nothing deleted", dr_attr)
+
+        # Footer
+        draw_footer(scr,
+            "Space:toggle  A:all  N:none  D:defaults  Tab:dry-run  Enter:start  Q:quit")
+
+        scr.refresh()
+
+        key = scr.getch()
+        if key == curses.KEY_UP:
+            cursor = max(0, cursor - 1)
+            # Skip separator
+            if cursor == OPTIN_START and scroll + (cursor - scroll) > 0:
+                cursor = max(0, cursor - 1)
+        elif key == curses.KEY_DOWN:
+            cursor = min(len(CATEGORIES) - 1, cursor + 1)
+        elif key == ord(' '):
+            selected[cursor] = not selected[cursor]
+        elif key in (ord('a'), ord('A')):
+            selected = [True] * len(CATEGORIES)
+        elif key in (ord('n'), ord('N')):
+            selected = [False] * len(CATEGORIES)
+        elif key in (ord('d'), ord('D')):
+            selected = [not c[3] for c in CATEGORIES]
+        elif key == 9:  # Tab
+            dry_run = not dry_run
+        elif key in (10, 13, curses.KEY_ENTER):
+            chosen = [CATEGORIES[i][0] for i in range(len(CATEGORIES)) if selected[i]]
+            if not chosen:
+                put(scr, dr_y + 1, 2, "  Select at least one category.",
+                    curses.color_pair(C_RED) | curses.A_BOLD)
+                scr.refresh()
+                time.sleep(1)
+                continue
+            return chosen, dry_run
+        elif key in (ord('q'), ord('Q')):
+            return None, False
+
+
+# ─────────────────────────────────────────────────────────
+#  SCREEN 2: CLEANUP PROGRESS
+# ─────────────────────────────────────────────────────────
+
+def screen_progress(scr, selected, dry_run):
+    """Run cleanup and show structured progress. Returns per-category results."""
+    ordered = [c for c in EXEC_ORDER if c in selected]
+    total = len(ordered)
+
+    # Per-category state
+    state = {}
+    for c in ordered:
+        state[c] = {"status": "pending", "detail": "", "freed": ""}
+
+    current_step = [0]
+    current_cat = [None]
+    done = [False]
+    raw_lines = []
+    freed_total = [0]  # in KB
+
+    def worker():
+        cmd = [SCLEAN, "-y"]
+        if dry_run:
+            cmd.append("-n")
+        cmd += ["--only", ",".join(selected)]
+
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, env={**os.environ, "TERM": "dumb"}
+            )
+            for line in proc.stdout:
+                clean = re.sub(r'\x1b\[[0-9;]*m', '', line.rstrip())
+                raw_lines.append(clean)
+
+                # Step header: [N/M] description
+                m = re.match(r'\[(\d+)/(\d+)\]\s*(.*)', clean)
+                if m:
+                    step_num = int(m.group(1))
+                    current_step[0] = step_num
+
+                    # Finalize previous category
+                    prev = current_cat[0]
+                    if prev and state[prev]["status"] == "running":
+                        state[prev]["status"] = "clean"
+                        if not state[prev]["detail"]:
+                            state[prev]["detail"] = "nothing to clean"
+
+                    # Start new category
+                    if step_num <= len(ordered):
+                        cat = ordered[step_num - 1]
+                        current_cat[0] = cat
+                        state[cat]["status"] = "running"
+                    continue
+
+                cat = current_cat[0]
+                if not cat:
+                    continue
+
+                low = clean.strip().lower()
+
+                # Parse meaningful lines
+                if "nothing to clean" in low or re.match(r'^no\s+(cleanable|orphan|broken|stale|failed)', low):
+                    state[cat]["status"] = "clean"
+                    state[cat]["detail"] = "nothing to clean"
+                elif "freed:" in low:
+                    fm = re.search(r'Freed:\s*(\S+)', clean)
+                    if fm:
+                        state[cat]["freed"] = fm.group(1)
+                        state[cat]["status"] = "freed"
+                        # Try to accumulate KB
+                        size_str = fm.group(1)
+                        kb = parse_size_to_kb(size_str)
+                        freed_total[0] += kb
+                elif "[dry run]" in low:
+                    state[cat]["status"] = "scanned"
+                    dm = re.search(r'Would\s+(.*)', clean, re.IGNORECASE)
+                    if dm:
+                        state[cat]["detail"] = dm.group(1).strip()[:60]
+                elif "skipped" in low:
+                    state[cat]["status"] = "skipped"
+                    state[cat]["detail"] = "skipped"
+                elif "found" in low:
+                    fm = re.search(r'Found\s+(.*)', clean, re.IGNORECASE)
+                    if fm:
+                        state[cat]["detail"] = fm.group(1).strip()[:60]
+                elif "done" in low or "✓" in clean:
+                    if state[cat]["status"] == "running":
+                        state[cat]["status"] = "freed" if state[cat]["freed"] else "clean"
+
+            # Finalize last category
+            if current_cat[0] and state[current_cat[0]]["status"] == "running":
+                state[current_cat[0]]["status"] = "clean"
+
+            proc.wait()
+        except Exception as e:
+            raw_lines.append(f"Error: {e}")
+        done[0] = True
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+    spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    frame = 0
+    scroll = 0
+
+    scr.nodelay(True)
+    scr.timeout(60)
+
+    while not done[0]:
+        h, w = scr.getmaxyx()
+        scr.erase()
+
+        mode = "Dry Run" if dry_run else "Cleaning"
+        s = spinner[frame % len(spinner)]
+        draw_header(scr, f" — {s} {mode}...")
+
+        # Progress bar
+        progress = current_step[0] / max(total, 1)
+        bar_w = min(w - 20, 50)
+        put(scr, 4, 2, "Progress", curses.color_pair(C_TEXT) | curses.A_BOLD)
+        draw_bar(scr, 4, 11, bar_w, progress * 100, C_GREEN)
+        put(scr, 4, 11 + bar_w + 2,
+            f"{current_step[0]}/{total}",
+            curses.color_pair(C_BORDER))
+
+        # Category status list
+        list_y = 6
+        list_h = h - 8
+
+        if len(ordered) > list_h:
+            # Auto-scroll to keep current step visible
+            active_idx = max(0, current_step[0] - 1)
+            if active_idx >= scroll + list_h - 2:
+                scroll = active_idx - list_h + 3
+            scroll = max(0, min(scroll, len(ordered) - list_h))
+
+        for vi in range(min(list_h, len(ordered) - scroll)):
+            idx = scroll + vi
+            if idx >= len(ordered):
+                break
+            cat = ordered[idx]
+            y = list_y + vi
+            st = state[cat]
+            label = CAT_LABEL.get(cat, cat)
+
+            # Status icon and color
+            if st["status"] == "freed":
+                icon = "✓"
+                icon_attr = curses.color_pair(C_GREEN) | curses.A_BOLD
+                detail = f"freed {st['freed']}" if st['freed'] else "cleaned"
+                detail_attr = curses.color_pair(C_GREEN) | curses.A_BOLD
+            elif st["status"] == "clean":
+                icon = "✓"
+                icon_attr = curses.color_pair(C_GREEN)
+                detail = st["detail"] or "nothing to clean"
+                detail_attr = curses.color_pair(C_DIM) | curses.A_DIM
+            elif st["status"] == "scanned":
+                icon = "~"
+                icon_attr = curses.color_pair(C_YELLOW)
+                detail = st["detail"] or "scanned"
+                detail_attr = curses.color_pair(C_YELLOW)
+            elif st["status"] == "running":
+                icon = spinner[frame % len(spinner)]
+                icon_attr = curses.color_pair(C_YELLOW) | curses.A_BOLD
+                detail = "working..."
+                detail_attr = curses.color_pair(C_YELLOW)
+            elif st["status"] == "skipped":
+                icon = "—"
+                icon_attr = curses.color_pair(C_DIM) | curses.A_DIM
+                detail = "skipped"
+                detail_attr = curses.color_pair(C_DIM) | curses.A_DIM
+            else:  # pending
+                icon = "·"
+                icon_attr = curses.color_pair(C_DIM) | curses.A_DIM
+                detail = ""
+                detail_attr = curses.color_pair(C_DIM) | curses.A_DIM
+
+            put(scr, y, 3, icon, icon_attr)
+            put(scr, y, 6, f"{label:<20s}", curses.color_pair(C_TEXT))
+            put(scr, y, 27, detail[:w - 30], detail_attr)
+
+        draw_footer(scr, "Working... please wait")
+        scr.refresh()
+        frame += 1
+
+        # Absorb keypresses
+        scr.getch()
+
+    scr.nodelay(False)
+    scr.timeout(-1)
+
+    return state, freed_total[0]
+
+
+def parse_size_to_kb(s):
+    """Parse a human-readable size string to KB."""
+    m = re.match(r'([\d.]+)\s*([KMGTP])', s, re.IGNORECASE)
+    if not m:
         return 0
-    fi
-    local prompt="$1"
-    echo -ne "   ${CYAN}$prompt [Y/n]:${RESET} "
-    read -r answer
-    [[ -z "$answer" || "$answer" =~ ^[Yy] ]]
-}
+    val = float(m.group(1))
+    unit = m.group(2).upper()
+    mult = {"K": 1, "M": 1024, "G": 1024**2, "T": 1024**3, "P": 1024**4}
+    return int(val * mult.get(unit, 1))
+
+
+# ─────────────────────────────────────────────────────────
+#  SCREEN 3: SUMMARY
+# ─────────────────────────────────────────────────────────
+
+def screen_summary(scr, state, disk_before, freed_kb, dry_run):
+    disk_after = disk_info()
+    ordered = list(state.keys())
+
+    # Separate results into categories
+    freed_cats = [(c, state[c]) for c in ordered if state[c]["status"] == "freed"]
+    clean_cats = [(c, state[c]) for c in ordered if state[c]["status"] == "clean"]
+    other_cats = [(c, state[c]) for c in ordered if state[c]["status"] not in ("freed", "clean")]
+
+    while True:
+        h, w = scr.getmaxyx()
+        scr.erase()
+
+        if dry_run:
+            draw_header(scr, " — Dry Run Complete")
+        else:
+            draw_header(scr, " — Cleanup Complete ✓")
+
+        y = 4
+
+        # Total freed
+        if freed_kb > 0 and not dry_run:
+            freed_str = human(freed_kb * 1024)
+            put(scr, y, 2, f"Total freed: {freed_str}",
+                curses.color_pair(C_GREEN) | curses.A_BOLD)
+        elif dry_run:
+            put(scr, y, 2, "Dry run — nothing was deleted",
+                curses.color_pair(C_YELLOW))
+        else:
+            put(scr, y, 2, "System was already clean",
+                curses.color_pair(C_DIM) | curses.A_DIM)
+        y += 2
+
+        # Before/after bars
+        bar_w = min(w - 30, 45)
+        put(scr, y, 2, "Before", curses.color_pair(C_DIM) | curses.A_DIM)
+        draw_bar(scr, y, 10, bar_w, disk_before['pct'], bar_color(disk_before['pct']))
+        put(scr, y, 10 + bar_w + 2, f"{disk_before['pct']:.0f}%",
+            curses.color_pair(C_DIM) | curses.A_DIM)
+
+        if not dry_run:
+            y += 1
+            put(scr, y, 2, "After ", curses.color_pair(C_DIM) | curses.A_DIM)
+            draw_bar(scr, y, 10, bar_w, disk_after['pct'], bar_color(disk_after['pct']))
+            put(scr, y, 10 + bar_w + 2, f"{disk_after['pct']:.0f}%",
+                curses.color_pair(C_GREEN))
+        y += 2
+
+        hline(scr, y, 2, w - 4, curses.color_pair(C_BORDER))
+        y += 1
+
+        # Freed categories
+        max_rows = h - y - 3
+        row = 0
+
+        if freed_cats and row < max_rows:
+            for cat_id, st in freed_cats:
+                if row >= max_rows:
+                    break
+                label = CAT_LABEL.get(cat_id, cat_id)
+                freed_str = st["freed"] or "cleaned"
+                put(scr, y + row, 3, "✓", curses.color_pair(C_GREEN) | curses.A_BOLD)
+                put(scr, y + row, 6, f"{label:<20s}", curses.color_pair(C_TEXT))
+                put(scr, y + row, 27, freed_str,
+                    curses.color_pair(C_GREEN) | curses.A_BOLD)
+                row += 1
+
+        # Scanned (dry run results)
+        if dry_run and other_cats and row < max_rows:
+            for cat_id, st in other_cats:
+                if row >= max_rows:
+                    break
+                if st["status"] == "scanned":
+                    label = CAT_LABEL.get(cat_id, cat_id)
+                    put(scr, y + row, 3, "~", curses.color_pair(C_YELLOW))
+                    put(scr, y + row, 6, f"{label:<20s}", curses.color_pair(C_TEXT))
+                    put(scr, y + row, 27, st["detail"][:w - 30],
+                        curses.color_pair(C_YELLOW))
+                    row += 1
+
+        # Clean summary (collapsed)
+        if clean_cats and row < max_rows:
+            put(scr, y + row, 3, "·", curses.color_pair(C_DIM) | curses.A_DIM)
+            put(scr, y + row, 6,
+                f"{len(clean_cats)} {'category' if len(clean_cats) == 1 else 'categories'} already clean",
+                curses.color_pair(C_DIM) | curses.A_DIM)
+
+        draw_footer(scr, "B:run again  Q:quit")
+        scr.refresh()
+
+        key = scr.getch()
+        if key in (ord('q'), ord('Q')):
+            return "quit"
+        elif key in (ord('b'), ord('B')):
+            return "again"
 
-is_category_enabled() {
-    local cat="$1"
-    # If --only was used, check if category is in the list
-    if [[ ${#ENABLED_CATEGORIES[@]} -gt 0 ]]; then
-        for c in "${ENABLED_CATEGORIES[@]}"; do
-            [[ "$c" == "$cat" ]] && return 0
-        done
-        return 1
-    fi
-    # If --skip was used, check if category should be skipped
-    for c in "${SKIPPED_CATEGORIES[@]}"; do
-        [[ "$c" == "$cat" ]] && return 1
-    done
-    # Skip opt-in only categories unless explicitly requested
-    for c in "${OPTIN_CATEGORIES[@]}"; do
-        [[ "$c" == "$cat" ]] && return 1
-    done
-    return 0
-}
 
-step_header() {
-    STEP_COUNT=$((STEP_COUNT + 1))
-    echo -e "\n${YELLOW}[${STEP_COUNT}/${TOTAL_STEPS}] $1${RESET}"
-    log "=== Step $STEP_COUNT: $1 ==="
-}
+# ─────────────────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────────────────
 
-dry_run_msg() {
-    if $DRY_RUN; then
-        echo -e "   ${MAGENTA}[DRY RUN]${RESET} $1"
-        log "[DRY RUN] $1"
-        return 0
-    fi
-    return 1
-}
+def main(stdscr):
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    init_colors()
 
-# ─── Cleanup Functions ──────────────────────────────────────────────
+    while True:
+        chosen, dry_run = screen_select(stdscr)
+        if chosen is None:
+            break
 
-clean_pacman_downloads() {
-    is_category_enabled "pacman" || return 0
-    step_header "Removing corrupted/interrupted pacman downloads"
+        disk_before = disk_info()
 
-    local before
-    before=$(get_dir_size /var/cache/pacman/pkg)
+        state, freed_kb = screen_progress(stdscr, chosen, dry_run)
 
-    local count=0
-    count=$(find /var/cache/pacman/pkg/ -name "download-*" -o -name "*.part" 2>/dev/null | wc -l)
+        action = screen_summary(stdscr, state, disk_before, freed_kb, dry_run)
+        if action == "quit":
+            break
 
-    if (( count == 0 )); then
-        echo -e "   ${DIM}Nothing to clean.${RESET}"
-        return
-    fi
 
-    echo "   Found $count corrupted/partial files."
-    if dry_run_msg "Would remove $count files from /var/cache/pacman/pkg/"; then
-        return
-    fi
+if __name__ == "__main__":
+    SCLEAN = _find_sclean_core()
 
-    sudo rm -rf /var/cache/pacman/pkg/download-* 2>/dev/null
-    sudo rm -rf /var/cache/pacman/pkg/*.part 2>/dev/null
+    # If called with any CLI arguments, pass through to sclean-core directly
+    # (preserves full CLI compatibility: sclean -n -y --only cache, etc.)
+    if len(sys.argv) > 1:
+        os.execvp(SCLEAN, [SCLEAN] + sys.argv[1:])
 
-    local after
-    after=$(get_dir_size /var/cache/pacman/pkg)
-    track_freed "$before" "$after"
-    echo -e "   ${GREEN}✓ Done.${RESET}"
-}
-
-clean_orphans() {
-    is_category_enabled "orphans" || return 0
-    step_header "Removing orphaned packages (unneeded dependencies)"
-
-    local orphans
-    orphans=$(pacman -Qdtq 2>/dev/null)
-
-    if [[ -z "$orphans" ]]; then
-        echo -e "   ${DIM}No orphaned packages found.${RESET}"
-        return
-    fi
-
-    local count
-    count=$(echo "$orphans" | wc -l)
-    echo "   Found $count orphaned packages:"
-    echo "$orphans" | sed 's/^/     - /'
-
-    if dry_run_msg "Would remove $count orphaned packages"; then
-        return
-    fi
-
-    if confirm "Remove these $count orphans?"; then
-        local current_orphans
-        current_orphans=$(pacman -Qdtq 2>/dev/null)
-        if [[ -n "$current_orphans" ]]; then
-            remove_packages "$current_orphans" || true
-        fi
-        echo -e "   ${GREEN}✓ Done.${RESET}"
-        log "Removed $count orphans"
-    else
-        echo -e "   ${DIM}Skipped.${RESET}"
-    fi
-}
-
-clean_deep_orphans() {
-    is_category_enabled "deep-orphans" || return 0
-    step_header "Removing deep orphan packages (including optional deps)"
-
-    local deep_orphans
-    deep_orphans=$(pacman -Qdttq 2>/dev/null)
-
-    if [[ -z "$deep_orphans" ]]; then
-        echo -e "   ${DIM}No deep orphans found.${RESET}"
-        return
-    fi
-
-    local count
-    count=$(echo "$deep_orphans" | wc -l)
-    echo "   Found $count deep orphan packages:"
-    echo "$deep_orphans" | sed 's/^/     - /'
-    echo -e "   ${DIM}Note: These can include optional dependencies you may still want.${RESET}"
-
-    if dry_run_msg "Would remove $count deep orphan packages"; then
-        return
-    fi
-
-    if confirm "Remove these $count deep orphans?"; then
-        local current_deep_orphans
-        current_deep_orphans=$(pacman -Qdttq 2>/dev/null)
-        if [[ -n "$current_deep_orphans" ]]; then
-            remove_packages "$current_deep_orphans" || true
-        fi
-        echo -e "   ${GREEN}✓ Done.${RESET}"
-        log "Removed $count deep orphans"
-    else
-        echo -e "   ${DIM}Skipped.${RESET}"
-    fi
-}
-
-clean_package_cache() {
-    is_category_enabled "cache" || return 0
-    step_header "Cleaning package cache (pacman + yay)"
-
-    local before
-    before=$(get_dir_size /var/cache/pacman/pkg)
-    local yay_before=0
-    [[ -d "$HOME/.cache/yay" ]] && yay_before=$(get_dir_size "$HOME/.cache/yay")
-    local total_before=$((before + yay_before))
-
-    # Show current cache size
-    echo "   Pacman cache: $(get_dir_size_human /var/cache/pacman/pkg)"
-    [[ -d "$HOME/.cache/yay" ]] && echo "   Yay cache: $(get_dir_size_human "$HOME/.cache/yay")"
-
-    if dry_run_msg "Would clean pacman + yay cache (keep last 1 version)"; then
-        return
-    fi
-
-    # Keep only 1 version of installed packages, remove all uninstalled
-    if command -v paccache &>/dev/null; then
-        if confirm "Clean cache (keep last 1 version)?"; then
-            sudo paccache -rk1 2>/dev/null || true
-            sudo paccache -ruk0 2>/dev/null || true
-            # Clean yay build cache
-            [[ -d "$HOME/.cache/yay" ]] && rm -rf "$HOME/.cache/yay"/* 2>/dev/null
-            local after
-            after=$(get_dir_size /var/cache/pacman/pkg)
-            local yay_after=0
-            [[ -d "$HOME/.cache/yay" ]] && yay_after=$(get_dir_size "$HOME/.cache/yay")
-            track_freed "$total_before" $((after + yay_after))
-            echo -e "   ${GREEN}✓ Done.${RESET}"
-        else
-            echo -e "   ${DIM}Skipped.${RESET}"
-        fi
-    else
-        echo -e "   ${DIM}paccache not found, using yay -Scc...${RESET}"
-        yay -Scc 2>/dev/null || true
-    fi
-}
-
-clean_journal() {
-    is_category_enabled "journal" || return 0
-    step_header "Cleaning old system logs (keeping last 50MB)"
-
-    local before
-    before=$(get_dir_size /var/log/journal 2>/dev/null || echo 0)
-    echo "   Current journal size: $(journalctl --disk-usage 2>/dev/null | grep -oP '[\d.,]+\s*\w+' | head -1)"
-
-    if dry_run_msg "Would vacuum journal to 50MB"; then
-        return
-    fi
-
-    sudo journalctl --vacuum-size=50M 2>/dev/null || true
-    local after
-    after=$(get_dir_size /var/log/journal 2>/dev/null || echo 0)
-    track_freed "$before" "$after"
-    echo -e "   ${GREEN}✓ Done.${RESET}"
-}
-
-clean_flatpak() {
-    is_category_enabled "flatpak" || return 0
-    step_header "Cleaning unused Flatpak runtimes"
-
-    if ! command -v flatpak &>/dev/null; then
-        echo -e "   ${DIM}Flatpak not installed. Skipping.${RESET}"
-        return
-    fi
-
-    local unused
-    unused=$(flatpak list --unused 2>/dev/null)
-
-    if [[ -z "$unused" ]]; then
-        echo -e "   ${DIM}No unused runtimes found.${RESET}"
-        return
-    fi
-
-    echo "   Unused runtimes found:"
-    echo "$unused" | sed 's/^/     /'
-
-    if dry_run_msg "Would remove unused Flatpak runtimes"; then
-        return
-    fi
-
-    if confirm "Remove unused Flatpak runtimes?"; then
-        # Prefer removing unused refs + stale app data when supported.
-        flatpak uninstall --unused --delete-data -y 2>/dev/null || flatpak uninstall --unused -y 2>/dev/null || true
-        echo -e "   ${GREEN}✓ Done.${RESET}"
-    else
-        echo -e "   ${DIM}Skipped.${RESET}"
-    fi
-}
-
-clean_flatpak_data() {
-    is_category_enabled "flatpak-data" || return 0
-    step_header "Cleaning orphaned Flatpak app data (~/.var/app)"
-
-    if ! command -v flatpak &>/dev/null; then
-        echo -e "   ${DIM}Flatpak not installed. Skipping.${RESET}"
-        return
-    fi
-
-    local data_root="$HOME/.var/app"
-    if [[ ! -d "$data_root" ]]; then
-        echo -e "   ${DIM}No Flatpak app-data directory found.${RESET}"
-        return
-    fi
-
-    local installed_apps
-    installed_apps=$(flatpak list --app --columns=application 2>/dev/null | sed '/^$/d')
-
-    local orphan_dirs=()
-    while IFS= read -r dir; do
-        local app_id
-        app_id=$(basename "$dir")
-        if [[ -n "$installed_apps" ]] && echo "$installed_apps" | grep -Fxq "$app_id"; then
-            continue
-        fi
-        orphan_dirs+=("$dir")
-    done < <(find "$data_root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
-
-    if (( ${#orphan_dirs[@]} == 0 )); then
-        echo -e "   ${DIM}No orphaned Flatpak app data found.${RESET}"
-        return
-    fi
-
-    local before=0
-    local dir
-    for dir in "${orphan_dirs[@]}"; do
-        before=$((before + $(get_dir_size "$dir")))
-    done
-
-    echo "   Found ${#orphan_dirs[@]} orphaned app-data dirs ($(human_size "$before")):"
-    local shown=0
-    for dir in "${orphan_dirs[@]}"; do
-        echo "     - $(basename "$dir")"
-        shown=$((shown + 1))
-        (( shown >= 15 )) && break
-    done
-    (( ${#orphan_dirs[@]} > 15 )) && echo "     ... and $(( ${#orphan_dirs[@]} - 15 )) more"
-
-    if dry_run_msg "Would remove ${#orphan_dirs[@]} orphaned Flatpak app-data directories"; then
-        return
-    fi
-
-    if confirm "Remove these orphaned Flatpak app-data directories?"; then
-        for dir in "${orphan_dirs[@]}"; do
-            rm -rf "$dir" 2>/dev/null
-        done
-
-        local after=0
-        for dir in "${orphan_dirs[@]}"; do
-            [[ -d "$dir" ]] && after=$((after + $(get_dir_size "$dir")))
-        done
-        track_freed "$before" "$after"
-        echo -e "   ${GREEN}✓ Done.${RESET}"
-    else
-        echo -e "   ${DIM}Skipped.${RESET}"
-    fi
-}
-
-clean_flatpak_cache() {
-    is_category_enabled "flatpak-cache" || return 0
-    step_header "Cleaning Flatpak cache/temp directories"
-
-    if ! command -v flatpak &>/dev/null; then
-        echo -e "   ${DIM}Flatpak not installed. Skipping.${RESET}"
-        return
-    fi
-
-    local user_dirs=(
-        "$HOME/.cache/flatpak"
-        "$HOME/.local/share/flatpak/repo/tmp"
-        "$HOME/.local/share/flatpak/repo/cache"
-    )
-    local system_dirs=(
-        "/var/lib/flatpak/repo/tmp"
-        "/var/lib/flatpak/repo/cache"
-    )
-
-    local total_before=0
-    local found=false
-    local dir
-
-    for dir in "${user_dirs[@]}"; do
-        if [[ -d "$dir" ]]; then
-            local s
-            s=$(get_dir_size "$dir")
-            if (( s > 0 )); then
-                found=true
-                total_before=$((total_before + s))
-                echo "   $dir ($(human_size "$s"))"
-            fi
-        fi
-    done
-
-    for dir in "${system_dirs[@]}"; do
-        if [[ -d "$dir" ]]; then
-            local s
-            s=$(du -sk "$dir" 2>/dev/null | awk '{print $1}')
-            s=${s:-0}
-            if (( s > 0 )); then
-                found=true
-                total_before=$((total_before + s))
-                echo "   $dir ($(human_size "$s"))"
-            elif $VERBOSE; then
-                echo "   $dir (exists, size unavailable without elevated read)"
-            fi
-        fi
-    done
-
-    if ! $found; then
-        echo -e "   ${DIM}No Flatpak cache directories with measurable data found.${RESET}"
-        return
-    fi
-
-    if dry_run_msg "Would clear Flatpak cache/temp directories ($(human_size "$total_before"))"; then
-        return
-    fi
-
-    if confirm "Clear Flatpak cache/temp directories?"; then
-        for dir in "${user_dirs[@]}"; do
-            [[ -d "$dir" ]] && find "$dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
-        done
-        for dir in "${system_dirs[@]}"; do
-            [[ -d "$dir" ]] && sudo find "$dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
-        done
-
-        local total_after=0
-        for dir in "${user_dirs[@]}"; do
-            [[ -d "$dir" ]] && total_after=$((total_after + $(get_dir_size "$dir")))
-        done
-        for dir in "${system_dirs[@]}"; do
-            if [[ -d "$dir" ]]; then
-                local s
-                s=$(du -sk "$dir" 2>/dev/null | awk '{print $1}')
-                s=${s:-0}
-                total_after=$((total_after + s))
-            fi
-        done
-
-        track_freed "$total_before" "$total_after"
-        echo -e "   ${GREEN}✓ Done.${RESET}"
-    else
-        echo -e "   ${DIM}Skipped.${RESET}"
-    fi
-}
-
-clean_temp_files() {
-    is_category_enabled "temp-files" || return 0
-    step_header "Cleaning old temporary files"
-
-    local before_tmp=0
-    local before_var_tmp=0
-    before_tmp=$(du -sk /tmp 2>/dev/null | awk '{print $1}')
-    before_var_tmp=$(du -sk /var/tmp 2>/dev/null | awk '{print $1}')
-    before_tmp=${before_tmp:-0}
-    before_var_tmp=${before_var_tmp:-0}
-    local total_before=$((before_tmp + before_var_tmp))
-
-    local tmp_count=0
-    local var_tmp_count=0
-    tmp_count=$(find /tmp -xdev -mindepth 1 -mtime +3 \( -type f -o -type l \) 2>/dev/null | wc -l)
-    var_tmp_count=$(find /var/tmp -xdev -mindepth 1 -mtime +7 \( -type f -o -type l \) 2>/dev/null | wc -l)
-
-    if (( tmp_count == 0 && var_tmp_count == 0 )); then
-        echo -e "   ${DIM}No old temporary files found.${RESET}"
-        return
-    fi
-
-    echo "   /tmp: $tmp_count old files/symlinks (>3 days)"
-    echo "   /var/tmp: $var_tmp_count old files/symlinks (>7 days)"
-
-    if dry_run_msg "Would remove old files from /tmp and /var/tmp"; then
-        return
-    fi
-
-    if confirm "Remove these old temporary files?"; then
-        find /tmp -xdev -mindepth 1 -mtime +3 \( -type f -o -type l \) -delete 2>/dev/null
-        find /tmp -xdev -mindepth 1 -type d -empty -mtime +3 -delete 2>/dev/null
-        sudo find /var/tmp -xdev -mindepth 1 -mtime +7 \( -type f -o -type l \) -delete 2>/dev/null || true
-        sudo find /var/tmp -xdev -mindepth 1 -type d -empty -mtime +7 -delete 2>/dev/null || true
-
-        local after_tmp=0
-        local after_var_tmp=0
-        after_tmp=$(du -sk /tmp 2>/dev/null | awk '{print $1}')
-        after_var_tmp=$(du -sk /var/tmp 2>/dev/null | awk '{print $1}')
-        after_tmp=${after_tmp:-0}
-        after_var_tmp=${after_var_tmp:-0}
-        track_freed "$total_before" $((after_tmp + after_var_tmp))
-        echo -e "   ${GREEN}✓ Done.${RESET}"
-    else
-        echo -e "   ${DIM}Skipped.${RESET}"
-    fi
-}
-
-
-clean_coredumps() {
-    is_category_enabled "coredumps" || return 0
-    step_header "Cleaning systemd coredumps"
-
-    local size
-    size=$(get_dir_size_human /var/lib/systemd/coredump 2>/dev/null || echo "0")
-    local count
-    count=$(find /var/lib/systemd/coredump -type f 2>/dev/null | wc -l)
-
-    if (( count == 0 )); then
-        echo -e "   ${DIM}No coredumps found.${RESET}"
-        return
-    fi
-
-    echo "   Found $count coredumps using $size"
-
-    if dry_run_msg "Would remove $count coredumps ($size)"; then
-        return
-    fi
-
-    if confirm "Remove all coredumps?"; then
-        local before
-        before=$(get_dir_size /var/lib/systemd/coredump)
-        sudo rm -rf /var/lib/systemd/coredump/* 2>/dev/null || true
-        local after
-        after=$(get_dir_size /var/lib/systemd/coredump)
-        track_freed "$before" "$after"
-        echo -e "   ${GREEN}✓ Done.${RESET}"
-    else
-        echo -e "   ${DIM}Skipped.${RESET}"
-    fi
-}
-
-clean_thumbnails() {
-    is_category_enabled "thumbnails" || return 0
-    step_header "Cleaning thumbnail cache"
-
-    local size="0K"
-    local before=0
-    for dir in "$HOME/.cache/thumbnails" "$HOME/.thumbnails"; do
-        if [[ -d "$dir" ]]; then
-            size=$(get_dir_size_human "$dir")
-            before=$((before + $(get_dir_size "$dir")))
-        fi
-    done
-
-    if (( before == 0 )); then
-        echo -e "   ${DIM}No thumbnail cache found.${RESET}"
-        return
-    fi
-
-    echo "   Thumbnail cache: $(human_size $before)"
-
-    if dry_run_msg "Would clear thumbnail cache"; then
-        return
-    fi
-
-    rm -rf "$HOME/.cache/thumbnails"/* 2>/dev/null
-    rm -rf "$HOME/.thumbnails"/* 2>/dev/null
-    echo -e "   ${GREEN}↳ Freed: $(human_size $before)${RESET}"
-    TOTAL_FREED=$((TOTAL_FREED + before))
-    echo -e "   ${GREEN}✓ Done.${RESET}"
-}
-
-clean_trash() {
-    is_category_enabled "trash" || return 0
-    step_header "Emptying trash bin"
-
-    local trash_dir="$HOME/.local/share/Trash"
-    if [[ ! -d "$trash_dir" ]] || [[ -z "$(ls -A "$trash_dir/files" 2>/dev/null)" ]]; then
-        echo -e "   ${DIM}Trash is already empty.${RESET}"
-        return
-    fi
-
-    local before
-    before=$(get_dir_size "$trash_dir")
-    local count
-    count=$(find "$trash_dir/files" -maxdepth 1 2>/dev/null | wc -l)
-    count=$((count - 1))  # subtract directory itself
-    echo "   Found $count items in trash ($(human_size $before))"
-
-    if dry_run_msg "Would empty trash ($count items, $(human_size $before))"; then
-        return
-    fi
-
-    if confirm "Empty trash?"; then
-        rm -rf "$trash_dir/files"/* 2>/dev/null
-        rm -rf "$trash_dir/info"/* 2>/dev/null
-        rm -rf "$trash_dir/expunged"/* 2>/dev/null
-        track_freed "$before" 0
-        echo -e "   ${GREEN}✓ Done.${RESET}"
-    else
-        echo -e "   ${DIM}Skipped.${RESET}"
-    fi
-}
-
-clean_broken_symlinks() {
-    is_category_enabled "broken-symlinks" || return 0
-    step_header "Finding broken symbolic links in home directory"
-
-    # Filter out runtime/expected broken symlinks (Chrome Singleton files, snap, etc.)
-    local broken
-    broken=$(find "$HOME" -maxdepth 4 -xtype l 2>/dev/null | grep -v \
-        -e 'SingletonLock' \
-        -e 'SingletonCookie' \
-        -e 'SingletonSocket' \
-        -e '.snap/' \
-        -e '/run/' \
-        -e '/proc/' \
-        -e '.steam/' \
-    )
-
-    if [[ -z "$broken" ]]; then
-        echo -e "   ${DIM}No broken symlinks found.${RESET}"
-        return
-    fi
-
-    local count
-    count=$(echo "$broken" | wc -l)
-    echo "   Found $count broken symlinks:"
-    echo "$broken" | head -20 | sed 's/^/     /'
-    (( count > 20 )) && echo "     ... and $((count - 20)) more"
-
-    if dry_run_msg "Would remove $count broken symlinks"; then
-        return
-    fi
-
-    if confirm "Remove $count broken symlinks?"; then
-        while IFS= read -r link; do
-            rm -f "$link" 2>/dev/null
-        done <<< "$broken"
-        echo -e "   ${GREEN}✓ Done.${RESET}"
-        log "Removed $count broken symlinks"
-    else
-        echo -e "   ${DIM}Skipped.${RESET}"
-    fi
-}
-
-clean_crash_reports() {
-    is_category_enabled "crash-reports" || return 0
-    step_header "Cleaning Electron/Chromium crash reports"
-
-    local crash_dirs
-    crash_dirs=$(find "$HOME" -maxdepth 5 -name "Crash Reports" -type d 2>/dev/null)
-
-    # Also look for crash dump files
-    local crash_files
-    crash_files=$(find "$HOME" -maxdepth 4 \( -name "*.dmp" -o -name "*.core" \) -type f 2>/dev/null)
-
-    if [[ -z "$crash_dirs" && -z "$crash_files" ]]; then
-        echo -e "   ${DIM}No crash reports found.${RESET}"
-        return
-    fi
-
-    local total_before=0
-    if [[ -n "$crash_dirs" ]]; then
-        echo "   Crash report directories:"
-        while IFS= read -r dir; do
-            local s
-            s=$(get_dir_size_human "$dir")
-            echo "     $dir ($s)"
-            total_before=$((total_before + $(get_dir_size "$dir")))
-        done <<< "$crash_dirs"
-    fi
-
-    if [[ -n "$crash_files" ]]; then
-        local fcount
-        fcount=$(echo "$crash_files" | wc -l)
-        echo "   Found $fcount crash dump files"
-    fi
-
-    if dry_run_msg "Would remove crash reports ($(human_size $total_before))"; then
-        return
-    fi
-
-    if confirm "Remove crash reports?"; then
-        if [[ -n "$crash_dirs" ]]; then
-            while IFS= read -r dir; do
-                rm -rf "$dir"/* 2>/dev/null
-            done <<< "$crash_dirs"
-        fi
-        if [[ -n "$crash_files" ]]; then
-            echo "$crash_files" | xargs rm -f 2>/dev/null
-        fi
-        (( total_before > 0 )) && {
-            echo -e "   ${GREEN}↳ Freed: $(human_size $total_before)${RESET}"
-            TOTAL_FREED=$((TOTAL_FREED + total_before))
-        }
-        echo -e "   ${GREEN}✓ Done.${RESET}"
-    else
-        echo -e "   ${DIM}Skipped.${RESET}"
-    fi
-}
-
-clean_mesa_shader() {
-    is_category_enabled "mesa-shader" || return 0
-    step_header "Cleaning Mesa/GPU shader cache"
-
-    local total_before=0
-    local found=false
-
-    for dir in "$HOME/.cache/mesa_shader_cache" "$HOME/.cache/mesa_shader_cache_db" \
-               "$HOME/.cache/radv_builtin_shaders64" "$HOME/.nv" \
-               "$HOME/.cache/nvidia" "$HOME/.cache/AMD"; do
-        if [[ -d "$dir" ]]; then
-            found=true
-            local s
-            s=$(get_dir_size "$dir")
-            total_before=$((total_before + s))
-            echo "   $dir ($(human_size $s))"
-        fi
-    done
-
-    # Qt shader cache
-    for dir in "$HOME/.cache"/qtshader*; do
-        if [[ -d "$dir" ]]; then
-            found=true
-            local s
-            s=$(get_dir_size "$dir")
-            total_before=$((total_before + s))
-            echo "   $dir ($(human_size $s))"
-        fi
-    done
-
-    if ! $found; then
-        echo -e "   ${DIM}No shader cache found.${RESET}"
-        return
-    fi
-
-    if dry_run_msg "Would clear shader caches ($(human_size $total_before))"; then
-        return
-    fi
-
-    if confirm "Clear shader caches? (will be regenerated as needed)"; then
-        for dir in "$HOME/.cache/mesa_shader_cache" "$HOME/.cache/mesa_shader_cache_db" \
-                   "$HOME/.cache/radv_builtin_shaders64" "$HOME/.nv" \
-                   "$HOME/.cache/nvidia" "$HOME/.cache/AMD"; do
-            [[ -d "$dir" ]] && rm -rf "$dir"/* 2>/dev/null
-        done
-        for dir in "$HOME/.cache"/qtshader*; do
-            [[ -d "$dir" ]] && rm -rf "$dir"/* 2>/dev/null
-        done
-        echo -e "   ${GREEN}↳ Freed: $(human_size $total_before)${RESET}"
-        TOTAL_FREED=$((TOTAL_FREED + total_before))
-        echo -e "   ${GREEN}✓ Done.${RESET}"
-    else
-        echo -e "   ${DIM}Skipped.${RESET}"
-    fi
-}
-
-clean_dev_caches() {
-    is_category_enabled "dev-caches" || return 0
-    step_header "Cleaning developer tool caches"
-
-    local total_before=0
-    local found=false
-
-    # Helper: check directory and accumulate size
-    check_dev_dir() {
-        local label="$1" dir="$2"
-        if [[ -d "$dir" ]]; then
-            local s
-            s=$(get_dir_size "$dir")
-            if (( s > 0 )); then
-                found=true
-                echo "   $label: $(human_size $s)"
-                total_before=$((total_before + s))
-            fi
-        fi
-    }
-
-    # npm cache (check dir directly — npm may not be in bash PATH)
-    check_dev_dir "npm cache" "$HOME/.npm"
-
-    # pip cache
-    check_dev_dir "pip cache" "$HOME/.cache/pip"
-
-    # Go module cache
-    local go_mod_dir="$HOME/go/pkg/mod"
-    command -v go &>/dev/null && go_mod_dir=$(go env GOMODCACHE 2>/dev/null || echo "$go_mod_dir")
-    check_dev_dir "Go module cache" "$go_mod_dir"
-
-    # Cargo/Rust registry cache
-    check_dev_dir "Cargo registry cache" "$HOME/.cargo/registry"
-
-    # Gradle cache
-    check_dev_dir "Gradle cache" "$HOME/.gradle/caches"
-
-    # Maven cache
-    check_dev_dir "Maven cache" "$HOME/.m2/repository"
-
-    # Composer cache
-    check_dev_dir "Composer cache" "$HOME/.cache/composer"
-
-    # Gem cache
-    check_dev_dir "Gem cache" "$HOME/.local/share/gem"
-
-    # Yarn cache
-    check_dev_dir "Yarn cache" "$HOME/.cache/yarn"
-    check_dev_dir "Yarn cache (v2+)" "$HOME/.yarn/cache"
-
-    # pnpm cache
-    check_dev_dir "pnpm cache" "$HOME/.local/share/pnpm/store"
-
-    # Playwright browsers
-    check_dev_dir "Playwright browsers" "$HOME/.cache/ms-playwright-go"
-    check_dev_dir "Playwright browsers" "$HOME/.cache/ms-playwright"
-
-    if ! $found; then
-        echo -e "   ${DIM}No developer caches found.${RESET}"
-        return
-    fi
-
-    echo "   Total: $(human_size $total_before)"
-
-    if dry_run_msg "Would clean developer caches ($(human_size $total_before))"; then
-        return
-    fi
-
-    if confirm "Clean developer caches?"; then
-        command -v npm &>/dev/null && npm cache clean --force 2>/dev/null || true
-        (command -v pip &>/dev/null || command -v pip3 &>/dev/null) && pip cache purge 2>/dev/null || true
-        command -v go &>/dev/null && go clean -modcache 2>/dev/null || true
-        if command -v cargo &>/dev/null; then
-            cargo cache -a 2>/dev/null || rm -rf "$HOME/.cargo/registry/cache"/* 2>/dev/null
-        fi
-        command -v composer &>/dev/null && composer clear-cache 2>/dev/null || true
-        # Direct directory removal for caches that don't need a tool
-        [[ -d "$HOME/.npm" ]] && rm -rf "$HOME/.npm"/_cacache 2>/dev/null
-        [[ -d "$HOME/.cache/pip" ]] && rm -rf "$HOME/.cache/pip"/* 2>/dev/null
-        [[ -d "$HOME/.gradle/caches" ]] && rm -rf "$HOME/.gradle/caches"/* 2>/dev/null
-        [[ -d "$HOME/.m2/repository" ]] && rm -rf "$HOME/.m2/repository"/* 2>/dev/null
-        [[ -d "$HOME/.cache/yarn" ]] && rm -rf "$HOME/.cache/yarn"/* 2>/dev/null
-        [[ -d "$HOME/.yarn/cache" ]] && rm -rf "$HOME/.yarn/cache"/* 2>/dev/null
-        [[ -d "$HOME/.local/share/pnpm/store" ]] && rm -rf "$HOME/.local/share/pnpm/store"/* 2>/dev/null
-        [[ -d "$HOME/.cache/ms-playwright-go" ]] && rm -rf "$HOME/.cache/ms-playwright-go"/* 2>/dev/null
-        [[ -d "$HOME/.cache/ms-playwright" ]] && rm -rf "$HOME/.cache/ms-playwright"/* 2>/dev/null
-        echo -e "   ${GREEN}↳ Freed: ~$(human_size $total_before)${RESET}"
-        TOTAL_FREED=$((TOTAL_FREED + total_before))
-        echo -e "   ${GREEN}✓ Done.${RESET}"
-    else
-        echo -e "   ${DIM}Skipped.${RESET}"
-    fi
-}
-
-clean_old_logs() {
-    is_category_enabled "old-logs" || return 0
-    step_header "Cleaning rotated/old log files"
-
-    local before
-    before=$(get_dir_size /var/log 2>/dev/null || echo 0)
-
-    # Use find without sudo first (readable files), fall back gracefully
-    local count=0
-    count=$(find /var/log -type f \( -name "*.old" -o -name "*.gz" -o -name "*.xz" -o -name "*.bz2" -o -name "*.[0-9]" -o -name "*.[0-9].gz" \) 2>/dev/null | wc -l)
-
-    if (( count == 0 )); then
-        echo -e "   ${DIM}No old log files found.${RESET}"
-        return
-    fi
-
-    echo "   Found $count rotated/compressed log files"
-
-    if dry_run_msg "Would remove $count old log files"; then
-        return
-    fi
-
-    if confirm "Remove old/rotated log files?"; then
-        sudo find /var/log -type f \( -name "*.old" -o -name "*.gz" -o -name "*.xz" -o -name "*.bz2" -o -name "*.[0-9]" -o -name "*.[0-9].gz" \) -delete 2>/dev/null || true
-        local after
-        after=$(get_dir_size /var/log 2>/dev/null || echo 0)
-        track_freed "$before" "$after"
-        echo -e "   ${GREEN}✓ Done.${RESET}"
-    else
-        echo -e "   ${DIM}Skipped.${RESET}"
-    fi
-}
-
-check_pacnew() {
-    is_category_enabled "pacnew" || return 0
-    step_header "Checking for .pacnew/.pacsave config files"
-
-    # Use locate or find without sudo to avoid password prompt
-    local files
-    files=$(find /etc -name "*.pacnew" -o -name "*.pacsave" 2>/dev/null)
-
-    if [[ -z "$files" ]]; then
-        echo -e "   ${DIM}No .pacnew or .pacsave files found. 👍${RESET}"
-        return
-    fi
-
-    echo -e "   ${YELLOW}Found config files that need manual review:${RESET}"
-    echo "$files" | sed 's/^/     ⚠ /'
-    echo -e "   ${DIM}Tip: Use 'pacdiff' or 'sudo nvim <file>' to review & merge these.${RESET}"
-    echo -e "   ${DIM}(sclean will not modify these — manual review required)${RESET}"
-    log "Found .pacnew/.pacsave files: $(echo "$files" | tr '\n' ', ')"
-}
-
-clean_systemd_failed() {
-    is_category_enabled "systemd-failed" || return 0
-    step_header "Resetting failed systemd units"
-
-    local failed
-    failed=$(systemctl --failed --plain --no-legend 2>/dev/null)
-
-    if [[ -z "$failed" ]]; then
-        echo -e "   ${DIM}No failed units. 👍${RESET}"
-        return
-    fi
-
-    echo "   Failed units:"
-    echo "$failed" | sed 's/^/     /'
-
-    if dry_run_msg "Would reset failed systemd units"; then
-        return
-    fi
-
-    sudo systemctl reset-failed 2>/dev/null || true
-    echo -e "   ${GREEN}✓ Reset complete.${RESET}"
-    log "Reset failed systemd units"
-}
-
-clean_service_leftovers() {
-    is_category_enabled "service-leftovers" || return 0
-    step_header "Cleaning leftover systemd links and not-found units"
-
-    local sys_notfound=""
-    local user_notfound=""
-    local sys_broken_links=""
-    local user_broken_links=""
-
-    sys_notfound=$(systemctl list-units --all --plain --no-legend 2>/dev/null | awk '$2=="not-found"{print $1}')
-    user_notfound=$(systemctl --user list-units --all --plain --no-legend 2>/dev/null | awk '$2=="not-found"{print $1}')
-    sys_broken_links=$(find /etc/systemd/system /etc/systemd/user -xtype l 2>/dev/null)
-    user_broken_links=$(find "$HOME/.config/systemd/user" -xtype l 2>/dev/null)
-
-    local sys_nf_count=0
-    local user_nf_count=0
-    local sys_link_count=0
-    local user_link_count=0
-    [[ -n "$sys_notfound" ]] && sys_nf_count=$(echo "$sys_notfound" | wc -l)
-    [[ -n "$user_notfound" ]] && user_nf_count=$(echo "$user_notfound" | wc -l)
-    [[ -n "$sys_broken_links" ]] && sys_link_count=$(echo "$sys_broken_links" | wc -l)
-    [[ -n "$user_broken_links" ]] && user_link_count=$(echo "$user_broken_links" | wc -l)
-
-    local total_items=$((sys_nf_count + user_nf_count + sys_link_count + user_link_count))
-    if (( total_items == 0 )); then
-        echo -e "   ${DIM}No leftover systemd links/units found.${RESET}"
-        return
-    fi
-
-    (( sys_link_count > 0 )) && echo "   Broken system links: $sys_link_count"
-    (( user_link_count > 0 )) && echo "   Broken user links: $user_link_count"
-    (( sys_nf_count > 0 )) && echo "   System not-found units: $sys_nf_count"
-    (( user_nf_count > 0 )) && echo "   User not-found units: $user_nf_count"
-
-    if dry_run_msg "Would clean $total_items leftover systemd links/units"; then
-        return
-    fi
-
-    if confirm "Remove/disable these leftover systemd entries?"; then
-        if [[ -n "$sys_broken_links" ]]; then
-            while IFS= read -r link; do
-                sudo rm -f "$link" 2>/dev/null || true
-            done <<< "$sys_broken_links"
-        fi
-        if [[ -n "$user_broken_links" ]]; then
-            while IFS= read -r link; do
-                rm -f "$link" 2>/dev/null || true
-            done <<< "$user_broken_links"
-        fi
-        if [[ -n "$sys_notfound" ]]; then
-            while IFS= read -r unit; do
-                sudo systemctl disable "$unit" 2>/dev/null || true
-                sudo systemctl reset-failed "$unit" 2>/dev/null || true
-            done <<< "$sys_notfound"
-        fi
-        if [[ -n "$user_notfound" ]]; then
-            while IFS= read -r unit; do
-                systemctl --user disable "$unit" 2>/dev/null || true
-                systemctl --user reset-failed "$unit" 2>/dev/null || true
-            done <<< "$user_notfound"
-        fi
-        sudo systemctl daemon-reload 2>/dev/null || true
-        systemctl --user daemon-reload 2>/dev/null || true
-
-        echo -e "   ${GREEN}✓ Done.${RESET}"
-        log "Cleaned leftover systemd entries: $total_items"
-    else
-        echo -e "   ${DIM}Skipped.${RESET}"
-    fi
-}
-
-clean_browser_cache() {
-    is_category_enabled "browser-cache" || return 0
-    step_header "Cleaning browser cache data"
-
-    local total_before=0
-    local found=false
-
-    # Google Chrome cache
-    local chrome_cache="$HOME/.cache/google-chrome"
-    if [[ -d "$chrome_cache" ]]; then
-        local s
-        s=$(get_dir_size "$chrome_cache")
-        if (( s > 0 )); then
-            found=true
-            echo "   Chrome cache: $(human_size $s)"
-            total_before=$((total_before + s))
-        fi
-    fi
-
-    # Chromium cache
-    local chromium_cache="$HOME/.cache/chromium"
-    if [[ -d "$chromium_cache" ]]; then
-        local s
-        s=$(get_dir_size "$chromium_cache")
-        if (( s > 0 )); then
-            found=true
-            echo "   Chromium cache: $(human_size $s)"
-            total_before=$((total_before + s))
-        fi
-    fi
-
-    # Firefox cache
-    local firefox_cache="$HOME/.cache/mozilla/firefox"
-    if [[ -d "$firefox_cache" ]]; then
-        local s
-        s=$(get_dir_size "$firefox_cache")
-        if (( s > 0 )); then
-            found=true
-            echo "   Firefox cache: $(human_size $s)"
-            total_before=$((total_before + s))
-        fi
-    fi
-
-    # Brave cache
-    local brave_cache="$HOME/.cache/BraveSoftware"
-    if [[ -d "$brave_cache" ]]; then
-        local s
-        s=$(get_dir_size "$brave_cache")
-        if (( s > 0 )); then
-            found=true
-            echo "   Brave cache: $(human_size $s)"
-            total_before=$((total_before + s))
-        fi
-    fi
-
-    # Vivaldi cache
-    local vivaldi_cache="$HOME/.cache/vivaldi"
-    if [[ -d "$vivaldi_cache" ]]; then
-        local s
-        s=$(get_dir_size "$vivaldi_cache")
-        if (( s > 0 )); then
-            found=true
-            echo "   Vivaldi cache: $(human_size $s)"
-            total_before=$((total_before + s))
-        fi
-    fi
-
-    if ! $found; then
-        echo -e "   ${DIM}No browser cache found.${RESET}"
-        return
-    fi
-
-    echo "   Total: $(human_size $total_before)"
-    echo -e "   ${DIM}Note: Browsers will regenerate cache as needed.${RESET}"
-
-    if dry_run_msg "Would clear browser caches ($(human_size $total_before))"; then
-        return
-    fi
-
-    if confirm "Clear browser caches? (close browsers first!)"; then
-        [[ -d "$chrome_cache" ]] && rm -rf "$chrome_cache"/* 2>/dev/null
-        [[ -d "$chromium_cache" ]] && rm -rf "$chromium_cache"/* 2>/dev/null
-        [[ -d "$firefox_cache" ]] && rm -rf "$firefox_cache"/* 2>/dev/null
-        [[ -d "$brave_cache" ]] && rm -rf "$brave_cache"/* 2>/dev/null
-        [[ -d "$vivaldi_cache" ]] && rm -rf "$vivaldi_cache"/* 2>/dev/null
-        echo -e "   ${GREEN}↳ Freed: $(human_size $total_before)${RESET}"
-        TOTAL_FREED=$((TOTAL_FREED + total_before))
-        echo -e "   ${GREEN}✓ Done.${RESET}"
-    else
-        echo -e "   ${DIM}Skipped.${RESET}"
-    fi
-}
-
-
-
-clean_stale_processes() {
-    is_category_enabled "stale-procs" || return 0
-    step_header "Terminating stale user processes (deleted executables)"
-
-    local uid
-    uid=$(id -u)
-
-    local stale_pids=()
-    local stale_meta=()
-    local total_rss=0
-
-    local proc pid proc_uid target comm rss
-    for proc in /proc/[0-9]*; do
-        pid="${proc##*/}"
-        [[ "$pid" == "$$" || "$pid" == "$PPID" ]] && continue
-        [[ -r "$proc/status" && -L "$proc/exe" ]] || continue
-
-        proc_uid=$(awk '/^Uid:/ {print $2}' "$proc/status" 2>/dev/null)
-        [[ "$proc_uid" == "$uid" ]] || continue
-
-        target=$(readlink "$proc/exe" 2>/dev/null || true)
-        [[ "$target" == *"(deleted)"* ]] || continue
-
-        comm=$(awk '/^Name:/ {print $2}' "$proc/status" 2>/dev/null)
-        rss=$(awk '/^VmRSS:/ {print $2}' "$proc/status" 2>/dev/null)
-        rss=${rss:-0}
-
-        stale_pids+=("$pid")
-        stale_meta+=("$pid:$comm:$rss")
-        total_rss=$((total_rss + rss))
-    done
-
-    local count=${#stale_pids[@]}
-    if (( count == 0 )); then
-        echo -e "   ${DIM}No stale user processes found.${RESET}"
-        return
-    fi
-
-    echo "   Found $count stale user processes (RSS: ~$(human_size "$total_rss"))"
-    local shown=0
-    local item
-    for item in "${stale_meta[@]}"; do
-        local p c r
-        IFS=':' read -r p c r <<< "$item"
-        echo "     PID $p  $c  RSS $(human_size "$r")"
-        shown=$((shown + 1))
-        (( shown >= 15 )) && break
-    done
-    (( count > 15 )) && echo "     ... and $((count - 15)) more"
-
-    if dry_run_msg "Would terminate $count stale user processes"; then
-        return
-    fi
-
-    if confirm "Terminate these stale processes?"; then
-        kill -TERM "${stale_pids[@]}" 2>/dev/null || true
-        sleep 1
-
-        local still_alive=()
-        for pid in "${stale_pids[@]}"; do
-            kill -0 "$pid" 2>/dev/null && still_alive+=("$pid")
-        done
-
-        if (( ${#still_alive[@]} > 0 )); then
-            kill -KILL "${still_alive[@]}" 2>/dev/null || true
-            sleep 1
-        fi
-
-        local remaining=0
-        for pid in "${stale_pids[@]}"; do
-            kill -0 "$pid" 2>/dev/null && remaining=$((remaining + 1))
-        done
-        local terminated=$((count - remaining))
-
-        echo "   Terminated $terminated/$count stale processes."
-        (( remaining > 0 )) && echo -e "   ${DIM}$remaining process(es) could not be terminated.${RESET}"
-        echo -e "   ${GREEN}✓ Done.${RESET}"
-        log "Stale process cleanup: terminated $terminated of $count"
-    else
-        echo -e "   ${DIM}Skipped.${RESET}"
-    fi
-}
-
-clean_tmpfiles() {
-    is_category_enabled "tmpfiles-clean" || return 0
-    step_header "Running systemd-tmpfiles aging rules"
-
-    if dry_run_msg "Would run systemd-tmpfiles --clean"; then
-        return
-    fi
-    
-    if confirm "Run systemd-tmpfiles aging rules to clean old temp files?"; then
-        sudo systemd-tmpfiles --clean 2>/dev/null || true
-        echo -e "   ${GREEN}✓ Done.${RESET}"
-        log "Ran systemd-tmpfiles --clean"
-    else
-        echo -e "   ${DIM}Skipped.${RESET}"
-    fi
-}
-
-clean_user_cache() {
-    is_category_enabled "user-cache" || return 0
-    step_header "Cleaning old user caches and config backups"
-
-    local total_before=0
-    local found=false
-
-    # Search for cache files untouched for 30+ days
-    local cache_count
-    cache_count=$(find "$HOME/.cache" -mindepth 1 -type f -atime +30 2>/dev/null | wc -l)
-    
-    # Search for backup files in config/data dirs
-    local config_bak
-    config_bak=$(find "$HOME/.config" "$HOME/.local/share" -type f \( -name "*.bak" -o -name "*.old" -o -name "*~" -o -name "*.swp" -o -name "*.pacsave" \) 2>/dev/null | wc -l)
-
-    if (( cache_count == 0 && config_bak == 0 )); then
-        echo -e "   ${DIM}No old cache or backup files found.${RESET}"
-        return
-    fi
-
-    (( cache_count > 0 )) && echo "   Found $cache_count old cache file(s) (>30 days unaccessed)."
-    (( config_bak > 0 )) && echo "   Found $config_bak backup/old file(s) in .config/.local."
-
-    if dry_run_msg "Would remove old cache and config backups"; then
-        return
-    fi
-
-    if confirm "Clean old caches and config backups?"; then
-        if (( cache_count > 0 )); then
-            find "$HOME/.cache" -mindepth 1 -type f -atime +30 -delete 2>/dev/null
-            find "$HOME/.cache" -mindepth 1 -type d -empty -delete 2>/dev/null
-        fi
-        
-        if (( config_bak > 0 )); then
-            find "$HOME/.config" "$HOME/.local/share" -type f \( -name "*.bak" -o -name "*.old" -o -name "*~" -o -name "*.swp" -o -name "*.pacsave" \) -delete 2>/dev/null
-        fi
-        
-        echo -e "   ${GREEN}✓ Done.${RESET}"
-        log "Removed $cache_count old cache files, $config_bak config backups"
-    else
-        echo -e "   ${DIM}Skipped.${RESET}"
-    fi
-}
-
-check_foreign_packages() {
-    is_category_enabled "foreign-packages" || return 0
-    step_header "Checking for foreign packages (AUR / manually installed)"
-
-    local foreign_pkgs
-    foreign_pkgs=$(pacman -Qm 2>/dev/null)
-
-    if [[ -z "$foreign_pkgs" ]]; then
-        echo -e "   ${DIM}No foreign/AUR packages found. 👍${RESET}"
-        return
-    fi
-    
-    local count
-    count=$(echo "$foreign_pkgs" | wc -l)
-    echo -e "   ${YELLOW}Found $count foreign packages. These might be AUR or dropped upstream:${RESET}"
-    
-    echo "$foreign_pkgs" | head -20 | sed 's/^/     - /'
-    (( count > 20 )) && echo "     ... and $((count - 20)) more"
-    
-    echo -e "   ${DIM}Note: sclean will not modify these. Consider removing unneeded ones manually.${RESET}"
-    log "Found $count foreign packages for review."
-}
-
-clean_locale_purge() {
-    is_category_enabled "locale-purge" || return 0
-    step_header "Cleaning unused locale/translation files"
-
-    local current_lang
-    current_lang=$(echo "${LANG:-en_US.UTF-8}" | cut -d. -f1 | cut -d_ -f1)
-    local keep_locales=("en" "$current_lang" "locale.alias")
-
-    local before
-    before=$(get_dir_size /usr/share/locale 2>/dev/null || echo 0)
-
-    # Count locale dirs that aren't in our keep list
-    local removable=0
-    while IFS= read -r dir; do
-        local base
-        base=$(basename "$dir")
-        local keep=false
-        for k in "${keep_locales[@]}"; do
-            [[ "$base" == "$k"* ]] && keep=true
-        done
-        $keep || removable=$((removable + 1))
-    done < <(find /usr/share/locale -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
-
-    if (( removable == 0 )); then
-        echo -e "   ${DIM}No removable locale directories found.${RESET}"
-        return
-    fi
-
-    echo "   Found $removable locale directories (keeping: ${keep_locales[*]})"
-    echo "   Current locale dir size: $(human_size $before)"
-
-    if dry_run_msg "Would remove $removable unused locale directories"; then
-        return
-    fi
-
-    if confirm "Remove unused locale directories?"; then
-        while IFS= read -r dir; do
-            local base
-            base=$(basename "$dir")
-            local keep=false
-            for k in "${keep_locales[@]}"; do
-                [[ "$base" == "$k"* ]] && keep=true
-            done
-            $keep || sudo rm -rf "$dir" 2>/dev/null
-        done < <(find /usr/share/locale -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
-
-        local after
-        after=$(get_dir_size /usr/share/locale 2>/dev/null || echo 0)
-        track_freed "$before" "$after"
-        echo -e "   ${GREEN}✓ Done.${RESET}"
-        log "Removed $removable unused locale directories"
-    else
-        echo -e "   ${DIM}Skipped.${RESET}"
-    fi
-}
-
-clean_docker() {
-    is_category_enabled "docker" || return 0
-    step_header "Pruning Docker resources"
-
-    if ! command -v docker &>/dev/null; then
-        echo -e "   ${DIM}Docker not installed. Skipping.${RESET}"
-        return
-    fi
-
-    # Check if Docker daemon is running
-    if ! docker info &>/dev/null; then
-        echo -e "   ${DIM}Docker daemon not running. Skipping.${RESET}"
-        return
-    fi
-
-    local containers images volumes
-    containers=$(docker ps -a --filter status=exited -q 2>/dev/null | wc -l)
-    images=$(docker images --filter dangling=true -q 2>/dev/null | wc -l)
-    volumes=$(docker volume ls --filter dangling=true -q 2>/dev/null | wc -l)
-
-    echo "   Stopped containers: $containers"
-    echo "   Dangling images:    $images"
-    echo "   Dangling volumes:   $volumes"
-
-    if (( containers + images + volumes == 0 )); then
-        echo -e "   ${DIM}Nothing to prune.${RESET}"
-        return
-    fi
-
-    if dry_run_msg "Would prune stopped containers, dangling images/volumes & build cache"; then
-        return
-    fi
-
-    if confirm "Prune Docker resources?"; then
-        docker container prune -f 2>/dev/null || true
-        docker image prune -f 2>/dev/null || true
-        docker volume prune -f 2>/dev/null || true
-        docker builder prune -f 2>/dev/null || true
-        echo -e "   ${GREEN}✓ Done.${RESET}"
-        log "Docker pruned: $containers containers, $images images, $volumes volumes"
-    else
-        echo -e "   ${DIM}Skipped.${RESET}"
-    fi
-}
-
-clean_snap() {
-    is_category_enabled "snap" || return 0
-    step_header "Removing old snap revisions"
-
-    if ! command -v snap &>/dev/null; then
-        echo -e "   ${DIM}Snap not installed. Skipping.${RESET}"
-        return
-    fi
-
-    local old_snaps
-    old_snaps=$(snap list --all 2>/dev/null | awk '/disabled/{print $1, $3}')
-
-    if [[ -z "$old_snaps" ]]; then
-        echo -e "   ${DIM}No old snap revisions found.${RESET}"
-        return
-    fi
-
-    local count
-    count=$(echo "$old_snaps" | wc -l)
-    echo "   Found $count old snap revision(s):"
-    echo "$old_snaps" | head -10 | sed 's/^/     /'
-    (( count > 10 )) && echo "     ... and $((count - 10)) more"
-
-    if dry_run_msg "Would remove $count old snap revisions"; then
-        return
-    fi
-
-    if confirm "Remove old snap revisions?"; then
-        while IFS= read -r line; do
-            local name rev
-            name=$(echo "$line" | awk '{print $1}')
-            rev=$(echo "$line" | awk '{print $2}')
-            sudo snap remove "$name" --revision="$rev" 2>/dev/null || true
-        done <<< "$old_snaps"
-        echo -e "   ${GREEN}✓ Done.${RESET}"
-        log "Removed $count old snap revisions"
-    else
-        echo -e "   ${DIM}Skipped.${RESET}"
-    fi
-}
-
-
-clean_kde_cache() {
-    is_category_enabled "kde-cache" || return 0
-    step_header "Cleaning KDE/Plasma offline caches"
-
-    echo -e "   ${DIM}Only cleaning caches safe to remove while session is running.${RESET}"
-
-    # Safe to clean while session is running (crash metadata, http cache, old kcache files)
-    # NOT safe while live: plasmashell, kwin, ksycoca, plasma-svgelements, icon-cache
-    local kde_safe_dirs=(
-        "$HOME/.cache/kcrash-metadata"
-        "$HOME/.cache/kio_http"
-        "$HOME/.cache/kioexec"
-        "$HOME/.cache/krunner"
-        "$HOME/.cache/kcminit"
-    )
-
-    local total_before=0
-    local found=false
-
-    for pattern in "${kde_safe_dirs[@]}"; do
-        for item in $pattern; do
-            if [[ -e "$item" ]]; then
-                local s
-                s=$(get_dir_size "$item" 2>/dev/null || du -sk "$item" 2>/dev/null | awk '{print $1}')
-                s=${s:-0}
-                if (( s > 0 )); then
-                    found=true
-                    total_before=$((total_before + s))
-                fi
-            fi
-        done
-    done
-
-    if ! $found; then
-        echo -e "   ${DIM}No cleanable KDE/Plasma cache found.${RESET}"
-        return
-    fi
-
-    echo "   KDE/Plasma safe cache: $(human_size $total_before)"
-
-    if dry_run_msg "Would clear KDE/Plasma offline caches ($(human_size $total_before))"; then
-        return
-    fi
-
-    if confirm "Clear KDE/Plasma offline caches?"; then
-        for pattern in "${kde_safe_dirs[@]}"; do
-            for item in $pattern; do
-                if [[ -d "$item" ]]; then
-                    rm -rf "$item"/* 2>/dev/null
-                elif [[ -f "$item" ]]; then
-                    rm -f "$item" 2>/dev/null
-                fi
-            done
-        done
-        echo -e "   ${GREEN}↳ Freed: $(human_size $total_before)${RESET}"
-        TOTAL_FREED=$((TOTAL_FREED + total_before))
-        echo -e "   ${GREEN}✓ Done.${RESET}"
-        log "Cleaned KDE/Plasma offline caches"
-    else
-        echo -e "   ${DIM}Skipped.${RESET}"
-    fi
-}
-
-
-
-
-# ─── Summary Report ─────────────────────────────────────────────────
-
-print_summary() {
-    local after_disk
-    after_disk=$(df --output=avail / 2>/dev/null | tail -1 | tr -d ' ')
-
-    echo ""
-    echo -e "${BOLD}╔══════════════════════════════════════════════════════════╗${RESET}"
-    echo -e "${BOLD}║              🧹 Cleanup Summary Report                  ║${RESET}"
-    echo -e "${BOLD}╠══════════════════════════════════════════════════════════╣${RESET}"
-
-    if (( TOTAL_FREED > 0 )); then
-        local freed_human
-        freed_human=$(human_size $TOTAL_FREED)
-        echo -e "${BOLD}║${RESET}  ${GREEN}Total space freed: ~${freed_human}${RESET}"
-    else
-        echo -e "${BOLD}║${RESET}  ${DIM}No significant space was freed.${RESET}"
-    fi
-
-    echo -e "${BOLD}║${RESET}  Disk available:  $(df -h --output=avail / 2>/dev/null | tail -1 | tr -d ' ')"
-    echo -e "${BOLD}║${RESET}  Disk used:       $(df -h --output=pcent / 2>/dev/null | tail -1 | tr -d ' ')"
-
-    if $DRY_RUN; then
-        echo -e "${BOLD}║${RESET}"
-        echo -e "${BOLD}║${RESET}  ${MAGENTA}This was a DRY RUN — nothing was actually deleted.${RESET}"
-        echo -e "${BOLD}║${RESET}  ${MAGENTA}Run without -n to perform actual cleanup.${RESET}"
-    fi
-
-    echo -e "${BOLD}║${RESET}"
-    if $LOG_DISABLED; then
-        echo -e "${BOLD}║${RESET}  Log: ${DIM}disabled (no writable path)${RESET}"
-    else
-        echo -e "${BOLD}║${RESET}  Log: ${DIM}$LOG_FILE${RESET}"
-    fi
-    echo -e "${BOLD}╚══════════════════════════════════════════════════════════╝${RESET}"
-    echo ""
-
-    log "=== SUMMARY: Freed approximately $(human_size $TOTAL_FREED) ==="
-}
-
-# ─── Argument Parsing ────────────────────────────────────────────────
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -n|--dry-run)
-            DRY_RUN=true
-            shift
-            ;;
-        -y|--yes)
-            AUTO_YES=true
-            shift
-            ;;
-        -v|--verbose)
-            VERBOSE=true
-            shift
-            ;;
-        -i|--interactive|--ui)
-            INTERACTIVE_UI=true
-            shift
-            ;;
-        -h|--help)
-            usage
-            ;;
-        --only)
-            IFS=',' read -ra ENABLED_CATEGORIES <<< "$2"
-            shift 2
-            ;;
-        --skip)
-            IFS=',' read -ra SKIPPED_CATEGORIES <<< "$2"
-            shift 2
-            ;;
-        *)
-            echo -e "${RED}Unknown option: $1${RESET}"
-            echo "Use --help for usage information."
-            exit 1
-            ;;
-    esac
-done
-
-# Interactive setup wizard
-if $INTERACTIVE_UI; then
-    launch_interactive_ui
-fi
-
-# ─── Count enabled steps ─────────────────────────────────────────────
-
-for cat in "${ALL_CATEGORIES[@]}" "${OPTIN_CATEGORIES[@]}"; do
-    is_category_enabled "$cat" && TOTAL_STEPS=$((TOTAL_STEPS + 1))
-done
-
-# ─── Main ─────────────────────────────────────────────────────────────
-
-echo -e "${BLUE}"
-echo "╔══════════════════════════════════════════════════════════╗"
-echo "║        sclean — Deep System Cleanup v3.0           ║"
-echo "╚══════════════════════════════════════════════════════════╝"
-echo -e "${RESET}"
-
-if $DRY_RUN; then
-    echo -e "${MAGENTA}🔍 DRY RUN MODE — No files will be deleted.${RESET}"
-fi
-
-# Show disk usage before
-echo -e "${DIM}Disk usage before cleanup:${RESET}"
-df -h / --output=size,used,avail,pcent | head -2
-echo ""
-
-log "=== sclean v3.0 started ==="
-log "Dry run: $DRY_RUN | Auto yes: $AUTO_YES"
-
-# Run all enabled cleanup functions
-clean_pacman_downloads
-clean_orphans
-clean_deep_orphans
-clean_package_cache
-clean_journal
-clean_flatpak
-clean_flatpak_data
-clean_flatpak_cache
-clean_temp_files
-clean_user_cache
-clean_coredumps
-clean_thumbnails
-clean_trash
-clean_broken_symlinks
-clean_crash_reports
-clean_mesa_shader
-clean_dev_caches
-clean_old_logs
-check_pacnew
-check_foreign_packages
-clean_systemd_failed
-clean_service_leftovers
-clean_browser_cache
-clean_locale_purge
-clean_docker
-clean_snap
-clean_kde_cache
-clean_tmpfiles
-clean_stale_processes
-
-# Final summary
-print_summary
-
-echo -e "${GREEN}✨ System cleanup complete!${RESET}"
+    # No arguments: launch TUI
+    ensure_sudo()
+    curses.wrapper(main)
