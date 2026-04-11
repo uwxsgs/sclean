@@ -1,267 +1,782 @@
 #!/usr/bin/env python3
 """
-sclean-tui — Visual frontend for sclean system cleanup.
-Authenticates sudo BEFORE entering TUI, then provides a clean
-interactive experience for category selection, progress, and summary.
+sclean — System Cleanup TUI for Arch Linux
 """
 
 import curses
 import subprocess
-import re
 import os
 import sys
 import time
 import threading
 import shutil
+import signal
+from pathlib import Path
 
 # ─────────────────────────────────────────────────────────
-#  EMBEDDED SCLEAN-CORE (bash backend, compressed)
+#  UTILITY HELPERS
 # ─────────────────────────────────────────────────────────
 
-import base64
-import zlib
-import tempfile
-import atexit
-
-_CORE_B85 = (
-    "c-rNCU2_}9vFJN~#RQ^4K;jalWS`v7rhO<9l3Auih96F;WCgVZ7UUiRyYTLU6iqRer~7uQPU<?9s?<&8RNaSr-"
-    "|y4?JN^av3AcN`zjm<zso2V4xh(ANOixcwPft%zch7@gbWY=>a~kI7jR)k%KmG9IpZ?>Y;=e!B?);IEyg!P<g#7r2AIMG=O~}!8U"
-    "PNQEjc=zDa-60kGE6hFmG#d%+hPCwdjE)sKY$?Md=q7PoF?Sy>Ka+#PeA(1KMR5X+JOG-CPkDKK$dVcx+Y0Vmh-"
-    "3}K{QRtB%VaWFdi*a(vQRBn)K5#{5#0u>6+j-"
-    "a+ZbtXgGz+2<^uo{=oht+vzCHa`H>^Jk7>oQN+oa`uY?8*EsC%Y%YHry;=Y4>H2uN@#3)CeI;Hzffuj4dwcu86>pxxn`e6`UGe-"
-    "0Ja50=k~RJXo?mXg=)OAM60bgmS3A2e=_3Msw!g<)gonfKQTLcWt-"
-    "+H)v7;g^qMrqg<|F9N;p^Vv$*av_ILf2O*2(dH?{)WxKYr6ae71ko<xjh>j=P6j+sC`#bbBYe{N>*Mi{A6yz3ygn>8t&h-"
-    "OlPL?T4dIeja8~ht2&?pUw4PsWm_%J%0H5;rQVoc=*-"
-    "Bmk*EHP~)sg;T(3ic3x|6cXp4qp6$VivscIa$6I^7=P=|un`@1u<L*Ikd;jFsF+8wO`05BheZ6~d(B0{6Zyk4E>>utze_HKE_Z0<"
-    "Zy@f&C8jVPJ3DY4w9Yv%MD4wNR9Odw7TRxEDJS<2yO~~mr8Nke%j*7<C-"
-    "kt%jfs$qt_F<NhG@G1<Ne=M(=Mnk0beh2=CBsozOu`HCZvX@d<pV8BVSt331jBd)?N0M3)4uf6EE-"
-    "J56GUh_K1~2^_?hAQfuB#a^dd@v{CYf!lM84azXVw{NwWgxeUyg*49y_QXz4+8$w22M9Ss5)h@9k9J`Vzv57B@?>z8pq3P#beNH0"
-    "MKi)OAAUX+UalOl+r+X)CFMMKg8{7Ded*Pp}tFG!Ih8QYEhgX7&-"
-    "2Kj(;Npyv)K@^`Q0X$xWX8>aW>qa2xnHS+G3MN_FhklPIlt=+vV<_vvw`q13kwMzOh%%BV;e=caB8F<)oV3rUNgt(W{&7s)Mq`=-"
-    "L0WBcLq{R%pQj+~NptB2#ndgEZc8^*Ox;#5xtFkxHWid+(+lwg+uM*3`C9%4hi?DX(c9SofGd!`5`<oZkRVwB-WX)p0ZuITcXXa!"
-    "kt>{RSLt*#Ag3@Tu~p#3tGGB%rv>oCD8ePl0(OnSu7O|F-_b=pA+R>Wv`L0BE@h}f0P~C|MQ&BU#OlD|rzvo(hRYx-"
-    "*i?X~C)2{J6=SU!mSI>)i}(_2?uEcs=R|*bvJ1$6A7%ryHvR>{G}aZBtx+82R3kFrTFstgv**!hqV*M#EzaYd(DyLcaqwmj5tnh-"
-    "<as=T=1Rv(&Eb{R)zvTX+aZkF{;R#$B%eh6co+kb)YP}D=QtKdbvin;s``=MlJZ)K=n}-"
-    "aJeGgkX_ieVMKtJ8^0MEe)F8b|Mrk;(uouEd{O!|cR*lK1)-"
-    "*|?XaKJU(IiR+QPKyL+9nu7kilQ~9Y}5t93~h1FHZWSRgzAaPKU4nbV^051&ggK>hFMI!r!-"
-    "ee;$+T@Y<>=)*{&%m}Ok*%Wt?8n6<>pCH_tlkn98UoWF(%T*TwZUx_VqI^9IIa55qEBP<=i@2p;iSqEPEfruW9y7ak&OC=e^S=28"
-    ")Y^N=xvajqB8tlOOK|moU9c&jKEDFn|mQOHFBl+HHO0CEA?^rxDM6JTOE^DKAOrK#Zh>{9*dJDL{u0NyCFl^(~bQJdqdkfXi)3Mc"
-    "*sR97gjet~Hnsm0$K@P^#F)KlM3A3`MF;F~T!gJ@v!3p8-JYCb23i`JbT}GpH0)-1)c=)GQG8wPnCS`@3r7Q3@!+)ZpziM%-"
-    "R808aVTzje0N*2*YNLsRNOehT_M=WA|Mud%Agk<c2mj4Okk1SVpJ*!pZJ1I`#=^zXOei#%XH&ZWiW5{$aH-fjIfQ9V23b0p7*fL5"
-    "g3*Mo-"
-    "r(QYF|1znCDjCR?dpSM2UxfovZWAO0L}@SzU37bmQqI!Bittn6_4}vG>PruceFpIL~wTOBxw;0(`lk$P(JK<AQ>7Xynn`?xwt|RV"
-    "3s#@Ih5M8-6<0~>|+NeQIe0?nr@7sEq0kIs6-_QtB6jtFixOTFdSnXo)vPLj;6r!u<<>e#-"
-    "o7{rhb~DW~u!hMq?lm<xBc0i!S4wDwnN`2<3Qxnq@Gv+a>U%k}B3I+T*Wxx}Aejn2%wd7!HBFk(@zZD3(f0muNBi;u{Iia6_L>%S"
-    "h&5bGz@t@nlrG&T{3@_xAuaZB)Xz0!lg8tAueFLE?k413C(f+zQAZQ$;+7B_m4wkgk1@wx&fIaFvjNc*?FpZ?g4C0U_X98X)=#Um"
-    "jOVmH@MgvDycTJ<*M_`m_&9y23Olz8bD5G0RK8iwm;WxNS7TEDNuDoV|0oTcDGMppr6*V7I=`s^#bLu+YB8z$x?*HBfv&(b`=4*X"
-    "Cz1jT(Z4Z{EN={Msa&oA8rCZIZWd$uEBioL>N$02#W+OcS<q<!{#!#W?Swj+6Ab&UbBL39l83>=l%kc)@Rm){VW1eDkkwZ#}3&1&"
-    "%2|u8*d`t~ZGCeil=$Ok&y(bDSINO+ZDq#?-DhAG?~WCi(0$34rs9fKXr2)Pd-nCm{KC&FKIofuV02kl3!7gQ!$7^;&$I$WD|gn0"
-    "g(~*P>3Ddg-Y`wM&O!wub4gX>@OfUa8ktYNg)C3dK^dtSma-"
-    "%Af`_0wVw_q|V4GP=0C;jgUbCimRU*C`<KJl(!XBqcp07vY@M+>SZn6RMe_gQH`GH8mi>i8EUEyK+{r1b-"
-    "$u&P7)zNMIEoEYR*osjEWju8SQ{&eUhPCMs-qC9o6eIy;Ib#)I~K7(coN51r@M%rS8c~bWjIXQo{l#;b{wx05zw|X`p8+nvzWA>Z"
-    "VcI);6UatyVgLBOOExeN$seTj|v6=sKs_^bEbz<SVLeN|`yIu4&Q()JR3b67ABcp$we{`kE5S1*wm@P1R90JVSvrKs++q1yxV1pt"
-    "2N9%RVlxsKfQ9aqm3B>FG6T!oiK9Vt$0DqklH>|D&#ka<y((GZP+x?lB?1rIteH_|gRR(Vb)d)!9^tO$2bmB<^4IqIXe$ij%50P6"
-    "x`$eRU2j2Mf|PGW0s6UZ$ps!A|luXU6jsZMqUZLHHX@s}v#YZSrCoqiQ8~DlNWC0V_0$Rgir-"
-    "Ai@SKWJd>W7tWKm*sHMP5P$-+6|4}p0ozmeY1`bLNKD{xmm}k;^@(cnF$uN$ZqZNMU@}em(a8R!o--gK3BUk7fpru}Mc%9jpT6CI"
-    "+DNz_lm;o?&~!wq2y5RAl^Fll+YNgcW*$7+U#){k`?I0C>wlUo!oMfw?IJ^csAiuo++8nLb({TU(ca#v)lb`HRo7=#edJa(<ipPG"
-    "ZgLrpVmyXKbr9y;s%d;MTUBg(fZ7=8qHM(j#{wotcm^vl96dBiuL>`^K*=4UkWK1rqSv41MLKpjto-"
-    "|C3s5%?hUuoXbhp~pz_4yc13Z~FfXl5f{N`I<)ug-Wjfcdv0*IZjAGgn7cMzE~R$%gYv!zYm$Yx%x*qSOfj1>j%ONLXbOMOBy#D*"
-    ")!OofibgLj+j*1G}}_fb!hd(HYh4zmjs_I=zM_lodL*S~9y0Uw7}OA_e~U=pmqMMK0oX}3L8r<)mQd$ak@<!=k;rB=&)1EPPuZO*"
-    "93Cu~>)#B6{Mnc5uXeQ3dF0O71;HpI!a*)*X#b{@fpV1AKREEA;MD`j9b8RC-l@CocB-aO3Tl83?iuX6G*f0%!pATt9&@gM9_Q?W"
-    "QA+hkTBY{5baxB*B9|5)@=-0E8s`4*d#dV?&PwC^n4Jg}I-"
-    "W?=4o<<UDnPhcYsdjmKWJx<TgV5R^ncz!TOoud^oyXyup%_rp7_<numla*h4)PPVs4W@{(vv2EM)i8}aHNfBjn4)26ApBfB^-"
-    "`x^s{B9P;)zo{fiAk`G$TFkJLrB>vUgQKzSGWk=g@9;6FAXF#U{odj!Hw{I?7D=e#>3AxTta7qr3nS5O1!1M&i$bOQbLW9)VYnA5"
-    "%$S$qie)zKP#%x~r+QSyn8ugZDdkK-OgGndthK9bHDod>yQ}1l1=*si^Z+U-On4#tV@*eZT(?C9hAQ+7$jsNtwKV^;1l%wS|z)-"
-    "XFTi`aKN)QQToD8dAx?mDa`UG1XEnzG>H^1k-5%KNl?Gi4CunYd0PpUo2Gx0d){8qG=K-J&$j^VP~7bhPgufpRof#i4-"
-    "T(sAL0B%JP0+Qh(zm`z6nOu(;{F_rJN<O_b1a(f;0t<B&5@7yTPgWI9$3*6yVny5My>D;;uMC57mj8m$JWYQHDHd$Sh&`t9Q-"
-    "I9Hn?dl+JqG-ui?wi`G~tIKRqfqa2%1<Z`UKPS%gsOGp5eH>uT(#A_g2i7eSfVJePAK-drc@HP)e`2V;+xZzV>I!Y3;4jD$Z>jzq"
-    "f0Yupk*6GnK9#i7A8bBX&$-Gy{&f$Ja-"
-    "!n?4Ukf(fgum==zbIAp+^BHEns+8YtmF=zZtSCeH+Rk$QB;sobnkch_gG>Y?VjhFe2Ygfqc~X*fQND)G_IbI`mwjXNxQ9JaWZ6tM"
-    "OVl`SxG#`tNMlJYYkhOq+a6%B-8_=Q;*XpElsvecihCR-HRoLF*$o!*2EAuzp$(Yp>uigDx~DQ08~3xoVn`3^tq(-"
-    "A9kb)^Bcf{8j!78)Sv3os7by2PTysKkK*`fgQuCbPta0d&n=gRS-"
-    "`&!0S93Z8pt=BGvaLZgIx})64VY8LgnOzS||2Zq(DQbDY!gj0^Y96Q^597k5yEoWuhiFkh)Q+#*`kQ?3kNWeR^&w>mHBaa$hsKs2"
-    "$(J$E<2#U@8T{sBGVy2|2$di77j;#^+|Y)#6Avm_$XnhlQ<U@rxxVcj+CmUPuoiluMbeOo_e+yucYt|`+{&Z-"
-    "tV2u#chd5oB(S6`AhuR94{^K$$KQz*ZJ8PG5l{NQ`QRxi*b@83JGsP_N*`mJB}cO({!h!@H30Gt<ddivdp+UO3BD><kW@EgX3wh8"
-    "`F*H;j@+REF|g{af-<g^n>^seZEf5OCGvgHS7wa(ukwIy=44D7$(mLJ#ckJ0<?`$zKglS(-"
-    "?qH#byEr<u?jTBOh%D*51cx@tO>92K{j*k3Q?gBW60ToccGW5xSbuJsnxZt&pk6*Vvf|>e=vPD3QM2W2Q9LOV*H;s~|0YYYPnff&"
-    "<)#|y2s(8F@G<<8GP`^K5b7c#NB^~HzV7+1r+tn`}g;0HU_-"
-    "n14yVfgL*gF04^sQ9ytLD%2%sRy!=V!|8)?En=;qGW8ObET<LB7in<r_R42M-"
-    "72;a3|EUv4}+T5i9EbteapxG%nd&MJA04#9e3600Q{6>PMoVT@J4Nt3^!zo7>$_$LX+k=_cIuj32&MrF<tFW)3jzUY86U?)Kzb>K"
-    "R>eQwCj?hV<n5dMtZ>UFFMt3^cL9KSr+**)9{&<FH(o^WWzi8cB(cfS_yo9Lg6%r;C7e7zN-MTK<JQZUMAQGuBC^7wl-"
-    "$PZx0ivtVF2E4}g_v>fc2%{#TF(q4@=mdlhO;=tHrUV@2<#&SyB)qyH%Qy67ku0s>E;k(If^zYi=!b=K5B3dVVojQb5Inydg3YzB"
-    "n;MR=s{sKz%)l?)LXMeFdl#p+JAF8W)q=f$qQ9p=&^jk;f(jxEb3+}oqS2D%3!kx9kJJZH+9T+*w4P@2)7oY9Rs5vh0T?(W9gZQn"
-    "MNp)hany$&L-2<R(2aC+eeKC7Kv7!3;d@50r5pP7_G@k9DkU$<nj4x-;`Yb?{(s4HEQu<whQX~XjWPVJ=`E`d4t-"
-    ";?e2uQGmv&<vx`1#q>Ji!#F1`*|($~Ea_!z6P7kZuk)d`0XW6aZqKx8y}_>*6jN(GLY3G_X!6dYpg3v@6^g-"
-    "4s#tupR*K;_dxD&i(;fMkTXw}rSp5t}Zn2gX9i#Tcg}^|@0NWGs^ip22J)w@a)L*Q;f;e6yjexm?TEN5RmmJsLHSl#z;2l+c}0Rj"
-    "dr8gc*vMqN|W*j~IYDeI9{<4u@21L}Kcr4m2Q0Voh?DpX&r?sHr;QjP9G}+%?hjgZ_+&9A}qf7%})D@&3}tsH*;g%EyxlU{Q$4Y}"
-    "mNFhMkgFqH?^~%}AmLEWkbWC&rj2BeaM_?<No&5f|_gHF@wa_25=B%BePHlFn#Nfen)Fg{|dQ0r9P#G>;i6I==;51IxN|`v#~e%i"
-    "e-ZjFy(=7IeRLQ-o6Sxd|8_0SaVERRw9f4n5hVVh*xH^uTb^1I5vp$=uFTwp*gJljruieFKFF6n-"
-    "n`rkF1h4_U<c<dX|}fS8dpiEpugj!8v87$SB(CPI5M^h{CI6*HvCN>lk{5JF=a9+-"
-    "d!4E>sU6&&q^Wt5>mf!%a{iv`iJcq|5}Gr2fx>md3N2~zNLIQDy~HH<~*m0h(1qMPc_0-"
-    "xYflLV=F`v`(?vclHMu3&*4wHuo1LmMhN=r%bJH*~L3b^?Q^RyYcteH|mOp*_nSA<t>7%Mxo-"
-    "5g9R!QE@`M_Nr7qwdq2dzokNtDGCAtvxB3)Q9`1ocWpFqqsuX@yFoTA0ix*ZEY7nlvtckQ+L|kUroU>k3=e7(YBESk#&LMQLE%{8"
-    "3A#r3KmP~W0nxc?ge<TL#e*!X=MgVdcOs?rlZ)u_v8<7X7DNi95jxXv2E}(eK@~d-"
-    "Wke!bZh_J`+JhvG$*RZO+SD~BF4z7Py~NxrpAZfn8+x3K4hjRfmh;Z<IxOuD=`1&DPa3C{8k2--"
-    "&`duS(OXa@w_xU9+MqabSh9egKCF~f=KIPawhX$|bJwiiEVJ7hTMJ)3VNWQtwa=bI#`4PuWR0qbY<D&Y1~VQph0cP^w*YjKVmNfY"
-    "nW_g)*PX6dN5oa@@s{4;YIDx&h&4puwtr}6O<%oc-"
-    "8rmbexK9VM5V?Y_EFHB#x_XLTrORE;cV!b&N~(J9vOoo1uD5tr!+TaUSJ69RhSeSL23&NUw7_7Ug)DWLufdBrAv<bJXRq;X0The5"
-    "V1z{gGv&eYWE~ggmHo@8P)QH$MjYT61s0dK{2V!;B^mbvw{F1d%WtJG)bUR#BzADs!&L5Ben8YQ*IT#9Tp@ZYjUF^>l1(7=CbSoO"
-    "JK)&gcAXqFa^f}qYC{D`^1)Oo-OHpvra!{Gq1zz$~HXRu9Ofg)>j`=G0d17h>Xzhb)8(Y9LMb%(&7R6nsPQ;6=X$75u_!d5;Jc_$"
-    "R`X20UM(z;IZ>T6^2&1u}>FMEV{g+BVT$$%eXO*)eEwVb?-?<Rh8+*+RQo+cm^e;wH9G-"
-    "8=|V%f$vh>?;UqrV@hJRNs&<_b8c2lcsO4egtd7(psLlJwp#uVZL6eD<0edq7KO>DG5u}Foy{k>{q7w##Im+t%n<96c_4iR({)zB"
-    "ScqbmnyHWaeegtbfs2o&+@>!K+~2HvN#KR*E()p4ox?JV&}oJr=uG=`?d7vY)&>C85#DjWV}><LUEAhTS=2#DC>i;4zZhX2*Eqij"
-    "XogzLfN};oTfoY4K$hQpJ6K(L`}o`Z(YIHRm*LYnwT`b>3(w22KZX1+(w#4*{jO`LFmPm`0>pn4fRqkveN#hCQhos215aX9&2GF<"
-    "U3Qz6W%X3&;o5Q`a)Qn{8ZsuL0FCodE=8-<R6g-Xc$Dry7_#&Q`-"
-    "!$c4jzv+Ft;x2PvzE$m8rXF;t&O8=GiyN>2%_QVeWVYQubb_merzc6c^frlmK&<_6LwxF&Y9lWnyP6NEHpyy_{tfk_lh0&M`UEbb"
-    "{HOfC22(TuM<<qX;5~<{o0{WFfVmHQ%bLURUZ1bF5c)-"
-    "ac?Fd)SFub2ng#ifXPGr5ScxD!*>~=Q*Dd&0dzKg}h9_$OkMv=1_vlvUTUJMi0h6BDdT1{H71t&mKU_xwn-"
-    "5$`wR73<0?DLe3}HcEb~#`mqdB=2}T-"
-    "d*^pcoxyV3HSglulM9D)=DN50{Ag1iGQ(%%SdcGclSwZg$d~L9P=s4&BJNUz{zBdjzu7NypX7WLOa1eA-"
-    "{I0m+wtuHMDUJp&#!fqMky-H@c0r!zdmQ@I|d5`;P(iY9EcWQhu`5l`MbEDK-M0={AW>&T6-"
-    "1Yi`6!8XRgi7QO0JR&j#++h6lmu+r^H8Ep*LOV9!R|(fcVq+ifdBhi#a1=^{I;Paq6TYAFX7rP;LG8@g8!dR!*FcXRYd%aad&&<?"
-    "*g4UbOr5o*yNR$>Q?_@l2OgmC>+9us>CQ|7`v75DSQ7pjhi4r~@^e#Rw#rGQt$1P-"
-    "+<hZXcL6<qP%%!;)da8~&_Mvo#ScF?v%VoBN!P4Curx^p%vHpR3}Ca{G5E_be#^TKgGsiD39RBA*GE2NR_w5}pCE6e`Razg--"
-    "TzrX?g-uI`*bX_L^=pfGp$?`RRo4R4Dy`+iH}X2s9lV1Y+d#&rRW16<810l9T=mt2u1H!CxLRX8LRr$$n_0@5UY_-xciJ@JZThF2"
-    "FJF@1t5it??20$Y*|s<9&$tC?mw4Y(Zp8lE%UKRGp)^sFljh2#qBiLFOh@VC?7De79>i_C_D#MKtlfTWWRFJZ^u;eEE5Xo$2|*Hh"
-    "0oHE{bDF3tzC;>E*i2s1yChJ3o@1C<3_PXBJUb7bbyf*cmfvU$NiU`uMQmQ(vHYwdn<2j)iW?^0c6(06V!K9@GgOHRnNzZ+i){eD"
-    "Dct~I43p48ZZMp(R0r{+RXK@E5Tj<tJ7eb<DSVm|8@6hFX@1J;P~~)9Ommu(nzh7YnP|Mbcq|u@O3amz#TIg!05J!y>S#qg|Acxa"
-    "PFos<HN#a#1=Y`Ul!3L<EJULVt?KT9d!YUpnhSpoYLNCxD=WvFX5Ftd+7?6wfM@HU2M7glqaGyV*p1wnFJ!r@gK{hgtYy}0n+hL{"
-    "mhJ<~-twZx7xgSWWD$A*!syZxP&7gK<EP}?7B`>_sgErEIU?V-{r<7ohS{#}iCf*)ujXt^GvUbQnB@kfmx07w_8gZ%7c%c-"
-    "XE8&h#32>;J9Oj)Uac>l!g7CY-w-E>1@+B-cwziXz?f}fkoCFmuX9DkT}%ls;oQ~!ZY;-"
-    "5|K8=h5;V5}27q31t+iAIP%Yqh<6Tc1&Z=IoEq^b5RoQ~isG^Bb`->@H<)P<-"
-    "GFH{Uo0zrmxRJk&720a)#&|YL)^Tj$V%GrDZvTT<W4;{A%UotSnyEWq>Mh2(dzqnbuMmD$^q{=l%L?rh98yO>^2aT%8Gd1|@2Hvq"
-    "UYKHj-FIY$cFE%+lHQKZ;Gmde$r4g)4!==VzeTII7Zb_sx?2va#8Fi95}D;G;u(#$DZKPp4qtK8S;`TBK8L9acZ*7Veuj2hm1}B-"
-    "J}t}Dox+8E!KgKXH)WK#=ZwkNm+2N#9S`wEdpExkt6YTmEP(SKVU-zZKo)QSa|i>Aq6>)x>sBrFlF|$<oF`{Hi)PO7&K3q<cSUXN"
-    "JYI`dmFmK?!sUG(HHlZ57(n_1FX9YE6T8irVOV6w<m#e+MJJcI^URo5^es=w;hqH0d(u3<3bGcpuR#04^QZ+0=z=Z1M2GLF^#ki#"
-    "9uDk|HVEquM`+EwCR9_L{|LImb5QR{jm6y4E8X^0x`z}%T5MIM`C-"
-    "w!D4(99crP@^4Y)uo8VxI!WW1u1MY>b+w7e`@JsFwCE$VAvS4au8`Bv?&g6}NWa(3F3Eb%|~l*fDD<|q!~=u^z>T2{rsz^?ryD=W"
-    "JXt|zv`)sx@4q;Q59cn%DVQsA`e4nxI=P2rROJRYGn5Dyo)pBz$@U0<MJ@!dPU*bpxLf`(uZC+?D4q4&G-"
-    "tFZOyNvk*1g^OyQp(N5L*C()p<eN~RBkm>nR?;0vzAO>ggPZG?%RX+W=|vosem=rm?+W|#D)yygzwH2R+?ROGV8;beMB!MzcAYmF"
-    "E$TXf*<)~jL2m+&8sTmh5~km$g2P;+pRD;@K)JgLgZBk_vR3J#A_VD^wRv1pyvQ!LCGo>@#GS{X4GVgmN>FU!$8x6<^7-"
-    "eVD}vr<OqorS`w?gKdea`i-"
-    "gL%pU%xQ5?sj3;g{lUdiv@ulu&Bp!q4TLoqOeV&9tz~jUGU%@?opmXi|GZ+c0w!C?LL)+4nFFw_FN?f(J&`6I}Gp^UOm-"
-    "ApDtZ!rE_fyuAEUMpy@lccU-rrCx8r+&o6#F?j3q?riP;*9U9A_p`f47YT3wZc$U_6^QhSBX~K#-"
-    "0p!*p{0zT>S|^cQ3~02mrIks(vf<=zG-"
-    "?5$P^?wJ0AVZzzU5%Z?LHRYH*1{nb0KZAlcnD3)M_tiOfnj91a@8Cn}equr@@L)yNcnpPGD<~vbGXiWBD%3ApD9gJ^n)o-"
-    "Qm>WROVKLV&i6Zlw8?<+89lLX3)yrwaE=yTGXFHb;k?4d+cWJ>XlBr*}LvK=fC-TZYQ~FE1A}T9(SvpQJ^<CZEDJ`*E=x_2bVpJR"
-    "mG&ytaAP@pD57D<xCLCWju&O8=I|{I}2FuN<6+6_U@b0O{~gA43>&^v)lmqfc&N~#=mkjo1O0pR`}6>B_hq~#-"
-    "@|=zMRx_nD@JWZM*QlB&{pV>v4)nv(F;9jh#CGLDoQ)T&Z2@p!OkV|2;{7g{44=`&XUyx7^9A#>Bd>cJFfmU1ah6M=qH_3C2n@Qy"
-    "5(`NB`OzL#Ppr(h0qoBju+J`GO1P1M*cg0#F+~2dA>tqAdbq@TcSH2(w<x6J}bD_72L*u4x&*`K=g`5SQ8ApEN%bXLKc+X&-"
-    "EUv^P5o2!Gc}`Bn@=G8v1+9C9T1Xh6o0AOG+JErH37Fz(`%=G{I;UH@R~_^Y-"
-    "%GNdUXYSL&jmZr}Mq&ihgtyNckv_%qpkPu#^c%#8|6lrkS;GLy-1A%_-"
-    "a+cCef$+A;t#L92<t)|1Pf)IC)nV9E5+#@9#s16vo$amduev39mQ|&ummC(hO|y#V(>ClH(#|2=;e%@q_@ign<y4}Dt#UfS5R~|;"
-    "s0K@hK{6Xp?YjbYM&EXfx&DB>3@@Xk9F+E1K^i}y5h;0W7{cMUV|Zt1Uv_7W5;kA-"
-    "`B&A=Xk5|9$YD+WT<$DVZ2CIPDtf5CHk}kH88;%9Rw1p+Cy(2zB39|>yAPNoauRuGiD!!G{lM=XxD6^(01rmtHC&o=c3y~^ta2Y@"
-    "PccVj$%Bb36`ZBb`+(D2NYhjc5?2ftI)_KmS*ZimNZ90Ha^EVd+k|6e(L@{ahb7yToM#wAD)}_)SGydx^o&m+nSW`PHNQU9KT{)y"
-    "6y{_y&CaTunjx13(jYb&#41>3swyfDD*_GKRV`SCCyfei;Eub5E?@b?Ezv@?g;z&Oh%~F8@;%-"
-    "31haekfb7tfT2r5>!H;TOk{63}xULHH;pKvEVDJJU(BB&V)KIuo`?Ff%mkz3yHd>9UBvZI>S7ph<?<K@D!I>+OAEa5P7Fcsx@`E+"
-    "Y)B>w52Gu#jpg=8v+9Kfxs1>LMuw=pT11~8&2PvFoqlzp};YAy&-%42%Gq#Su|EJnJf`2|<t~4u6^=J@ask-"
-    "~d3_6CH$kF?M#P8wD7fVJ~mN|=SIVTWfKo9vu<R*8T&p@qi;b{Vmo}}%=g>gglfIS6274UZm`_T|!Uf0eTkI0AvLH+m;I%ysso_%"
-    "jVzq6iCzkg!BpqFHOUQtLj0$mmgXOZJ_clTy7+_;+IWuB2c>a|j78{D$cp%j4VaBLJPM{lwMD}K6xtrG<@rxSGfjQM$bLepIYq+m"
-    "><tC?3$K$%$*2*IHQLS<-`Rq5crd5A}r$So#cG6{k-E-"
-    ">$jN0vZN!SFJTF==X^U!~cAU;Lxnx}^7k;djshM=kyS2!_9Trvyc;S?ypjmm2|Zhw%Q>e(Tem{QYl#{P+5EU4rKqxv+V!6Ot*LRL"
-    "z7{aSG(fqRTkC+OT+p*-"
-    "qr4sp+`%<6r)>JX7~^3^8vwOv})rK|CBTWAB#f=zuwUOg=}bUo7KLv9<}^n;YQ<ga)CldN45>XtC?}2t5NpqZe#C;^8$9VMB|U(K"
-    "B(e=AiAlwT2PMVLjS!+;iG=D4-"
-    "|bCd*`bg)Fx<uVo&|&>MowwRW+ScWUsm0V_K*J3U;XS<pE`i_3T)ykpE<q*(#R6!a%>HY?3iW^w=lDphep@7)SUcz!Y?t)jrQ9!K"
-    "+5D0=g<FI}p%`ld&nq}QC86!8vHFY#*T9aS`>uml~;R)I1}Oh=M#A#o8|^)TaMIjS0`McE}>T;Cf-"
-    "!y?7>%rlsc6%S<bx=Nv_AQ54XmbgQPITujz<Y7W6-GlGUn%-"
-    ">MIeq+}uo8Cyrmc7?+MgNbdSg1XW3E1W3tx^I`)K~iN~RZ4i%U=7vMSlVrW3?y_Q9N9`0ax=>`+Ksv}70+PcLk|qgeU8h_w#+0Lz"
-    "^iT{{eL%@TMv7Yse|?2LfEFIWXJD68ar6MjHC6Uf9Jdizp}n<WjeE&<FKU;)iUT7t96dg0mQrX#5J$UxC7Uyh~^u1zWv*%HXk0U-"
-    "^Gpjr4dI>HXvAOs#`8NCn%)EncPQ4RDwn;*X%>aaOB$6g3e08Mn2H<w&|o(YFwmZzI~b(1BtUQ>XxI$Hsciv|YGs@Bx8leG1~I$}"
-    "s!!k42bDw@bufjdE*Twq4M8iw^HeORl;YM~us2U3w!lK|809QcsR+?$a|a})H<z<OSdUYB(vSk~*i?!Ci6^Kf(!n&Ic@o$Gh(!NS"
-    "P9$jrdrmd^DMM~*2cy;^kzdtjRFxR~9OSvp-"
-    "^IM#5=4%QjU`=o}gek?=}8^~QLV)oKU5_=RwnCuCJLEuG$)j2kt4$rK5r+5*n4Wn_YMDT1F^6&n_;qXAVPC`&#biRb3ypl*`hdId"
-    "?^$~iJrVuqocmSO3?a`;NSwA*S)BYK)7_bt?h3m+2dc{%?e&q<{aRM?R82PZPJ%LKRfK<$d*3(&jKy&y2@wuVy1X7_rKAOS@FIB}"
-    "yKS5=!JCIbtxNoA$&VER;J_kF{Fn#Axb;#a(i8@Zd2SZcX;bk1!8g&;VtqI~DDQooiLlX8`MlH4$Sx@n;m#DP-"
-    "Q93NH!pxojTD`>xssp%3a%#Q&ki`5Z1_yyb?2z-4z4sE7e{)D_)LD#}CWw0^r_s+3N6<N)mdxexLwPJ!-"
-    "E#Sidt@;Sw{mgkC`mu}dUskf2YsVgAHqZ5Yye#J`y+6bk=|wOkoOl3?6M`_a0)O!&TutwmpT`e`aA=eBijvF=GPgZESY8i(!b3B<"
-    "IHCRkok2nkBNU0hY4vf$J>f}n3DjHx@TF-"
-    "v2cKeXW7Y*qYTpeh4f^GU5G^YBeEURVu!`BRe;pM(*hf?E)AaYt6Zk^4i`AG45p?Lm0=za<V7+1`*Bo+=6go&EYCq}*Ipw^;Oa*Y"
-    "Li;^vj1=G?$BrV#1d7X$Dq0e3)hvSpJ^D7oJpc+UJ2&|G!GlK~jSql5n@jMyiKe~g(h{Yf{^sCdcSo?Rb88GTcZS8WUFcph<-"
-    "yr|;w2DK<lK?96<WMwKt*ay@BHp09&B`ou%bV?UABRHug7Jb;J`TE^jBHKjF8YQ?$ps7Vxa5UjaqH7`n07-"
-    "O~Ekj=A+UEamZ9JU%|Qb0^LLokubg)A08bo3gia<Pm?k#^+ED1z4HghzioX)#uXnomas<~O8`eJrx;nT^Y8!y1^(|`c%%CQ!R;#w"
-    "0nAH%7q1)dtiH4JjbB#a7+9`qBBv!KO}p$49)67#SRdpp#s`t5TN2z&(#?effwblF9a^21H<qR0iGJl)9R%C-"
-    "UFZW7n=DO$aD76cAH?d#2f5xyShZ)|=pz$PeOf19O2I{XR5ey}>PE*BCbM8OkP@0>xV}J*FF5WVzEtBUn7P^rmyht;-"
-    "gP@!EWH7}7mnh~NURo8+{03!^NDQ7u{AQR)`UQRVtPeuO?W1~nKND9)}>YAw=<P&B3RpB@9ym}OpR)@?UI5l+TOsT5O}r00WGZKR"
-    "^I*lB9DR(94Q|x-Z!El`Eo8;XQ1a$lK@2aaC7G&>wxAae|HRimdv->)Tf@p%sMPG<l>Sl#^JO;t-"
-    "<*?8i)Wi)v)h|;03I(M>^i@+-"
-    "V9vMuoStcy;!Yb{2N`yr1Jqoh<siR6r}ua_X5TdhXspR3_mW^~asg^u(MdZsmZtT`8gPANR1$2TsEUUA5S8pGXj1<*HeR*nM5xsr"
-    "+Ta3M$;s;7@BB;-_<4;gOP4ZATs|M?G|To=z5z+&zN*c>i2Qm~hWOm=fs}9tZTx)3wJm=e({&(ExWXGn#sK+(KAa-"
-    "PGogIX&c=+1JWbL%N8vK66Y#>~g;oc|W0{>*1%~Dc1|squ+PM8-myLx)7h@{mQz>r|nbxd-HRCH7W5Bt>Xr+s4H(gP<@%#Kb#G;P"
-    "00EDBXo>B9s@#;)k>+BvAq_o1aKX~8s#gzsHsmEnn8QDsT4Qa!HO1CA=aCYxbpy80Ok;0No+({>)x8c&1ddJTO{010`yH?pF@I|z"
-    "&@+#{PV2p3WWL~)vW}TS2W0<cIWJ&o!Pgabb8L)$-"
-    "AW+ES)o$eO9BKy#m~ezdo)R@mYd?`xoKaEKP=&4n*mBeE4}?BI=UX*2y91aEENjS0L|&G)-"
-    "X=!;3R%j*>4xtOGnuJ{SCEJi}F4t5(}#nbqkarV{TtyzeEK%t$P1;^w9o_51E~)!ioSDx@dJ{p6U1a7P5O$K)+pip)TOc?#G$k1e"
-    "-;!=2i~r!-Aza4(5U&E`F)9#vlbtB{8v$>V`}DLp#{Aus`R$ziLdPW~m7q<qUF1y(gTYdV;)>BGS2>iNP-"
-    "2DD^d<&R%x&#HDH#3#u|>=JP|_O3t8GH^HPjl$%N@s;*MvDeMs)~gpA0r+K|9Ic)lKM(%fEsiRfo<Y>Dg1gtceCpwoZaKbyJu>ex"
-    "*qWP|wiZrGv}T&3o2#((4$)ROS8(7o&v<MqgEAvZaGMSkFG??`ra>!EA48;J{ZFSE#hJQWH;k=3#8$(wa1FWk#p-w=wYo$D9;z-"
-    "?S2WYEVHH+`3vM&eNm_bcADsL^Bizz_!R)>;rzmLm#z66~M7vHIO>~!87TAMkSuihJcZXro+tyWEb7-"
-    "lmk{Vfgi{%~cs+DkCNGq6eaI9qx$)mTo_KjWJjNvsfG`Z0t7e9zdNrjs+<L`d+cPY3!xtPmSz#8+Q&RnRR5A)B7dFO>QH;nnAUur"
-    "Ys;_~~QCG!P>)|HMQE+W)bSnDwEJ*7j#eDgDshq5v=7S{uqgSfWt(8B1&3d=;l^oDZ=bFK@{IpjOtZ;q~gn8gdw;oz7HE8h5#F|("
-    "jTm*a?6KP-YMhm81g(2L#1j^~hI^hGa@cuaMs%XBmyixl4SE8YypT868yAWchv*NWmb3hX3t6Yg<F18wkKxnYRGSAckX64C&akrC"
-    "R`Q4CZ<;wUOm>;)Ok4b5C7jtZt>t8Q=59UOnK)|4II0`JHMl~3$<SxJsK7G2`Mn`Zg|IU0`zeIAQib1cZkIlUey1;hH(D-"
-    "mj^0Hpw6kZr=ONCI;_I|55M*MroUgW4A&=_}v?ZOxwL&br4(U1Gzr42CnVW>#!BR}Icx^HiZEsEgPl(wx(X!XFr1Y77$RM?OX?lI"
-    "w`%zIze$c!S6c?;9vFGaQ=l{?Lko<>}Tfhn-WIoTr865uQg_;Z8E1Nlnbvf{imNDW5QE6kEWp3y%@?#Dj{!r$I-"
-    "Cg2KQ&#c)vD<{=^1HF&tByT|KOG;C_zpyHqc23|Ah+knSR6zg?vQdzHOpjcnvCKV6sEt>trf>ZM%m8e8}ry4o{Gd|%<H9T0mIrH{"
-    "(fH9-"
-    "W6T1pK`D4AIy=yLE%V2*EMEAgT41P9eh(;Mkq(=TeuYB>zjr+Oa^<og!IVpr<^Boj^z0>VLy2gAQ!qN5+N5jnQ>ms|KfTguB>hnX"
-    "2JRC+W<pv!d##!J6fHcsQPur&$4(WJBZk{Wt2mZeFh6!{w!b7_ia$XcXz2FL^`h{lnZgbeL_Kz823@o~JY>)}<Y<?b%Ml0mvDo)`"
-    "4`E?&ye1(4t^2;-@-j89o4(nA66DzQN<#99+GP~@i)$pg+zF-&d2&9{3#p1Mw-"
-    "KqGFUY@0&kw*H~%tit>m@#)(XfJ-h!6Ym|sZGRYTPJ|K+txkBmUvA^tngJP67FCAh{dwp%q8Ij43Z@T_>I!uuQP-dZ{{X9u7{p0_"
-    "w$VW&kH1UwoZ|(M`^NHIEO!-"
-    "jC6mliHF4_7BnDqI(j2A=F7R7l?$#95PeYE)|bA!0Op!0wP%YJc{5|i8297QvK1HPuoa2}AJzvx^v$SQjA|IvKGrn-"
-    "P6%(sGJ5AogT@2$;}3se|B<69>^&gSE4w&NefatO*Jw~#+RGWHQeV+bmM|A`=3b*7(Ubyi2La?-"
-    "n@o$%@Di^y?pU(Az?Z=~OO*xl08(Wc78EP;Y3b(K{@%{*kAM2%$3OkYNA=&IOVX6d9{tgrWPktL|NehuoB1x<JmUO8?OEXe^J62}"
-    "|8k?%U}e_ly?2e~3J*#cb_Jc1<m%m~DS9-Z9^s)zNMNL-2@TyNIUEj03_iN$-"
-    ")Jq})(KGZw;<vQ;Pg2j#{CdIa%n?X5Yb1QaK%ewCfpsEnS{<oR0qIn$Y$yJA``V)vpGBw*bt{Jc5{<H9-"
-    "`H2PB6mK&f)9c;mNBq)yKu8S(oZBw_bE#9dF$ppTlMaDIF4Mj6h@T@(gYVrC<65^HSlFII9ach7PqNEhS|BKqG6E!D2S%Z3rjk`3"
-    "GDE_%7}3zv%7k9&J6_>+aO28zFlsJq<-}6h<b}N>T!8mT8n4YDeeoMcG_~PBDDGyVrF(>4)-"
-    "{k4>We)t56<`fh;ku?g1rqm!2}w+>%#FeQnE6Yyhy2d35{0!AwrTVTlFr0yuXYO$4_O>xsp4#F%)uKoFG7HlIAYU<Jh5}Xwv(NRg"
-    "|nsOgbbqT!zC|1lGB=3U&HW2}ABFs$`7YgpCEI*Hjh4JRI&lJ3CfOjoy4B~I=<aodLx_dM)uuA|2iC<13me~aOP51EG{!w>ccrm~"
-    "O-3#Km`vq7#;AtA0fOlU(_|Mk%@$NU>-pTH~@XrAvSWYG;%xMm${n9!?3I-"
-    "z!35*0=k&$2_>As?ZrnkLy+<mcsxZ6GAX1XU$7d!H#ysaEG=^1SueZ6~daQC(zwf&cL;;h}dJxMMS3^q$A=ywG&Yu$erC!5un&z2"
-    "FE?gc45>A7q+rhZ$iRwX#;)PjyQ#Na-;euHiMACO(e2w+kxKry_EzYnuP1LeEP2bzQ*h0~;e-qW}U;#C{CcIdK#IZ+9-BbpX-"
-    "^0Sc=EHt6u8}O~YJ#DO6To=6FKRDifWq**e#A{pyN85r%4l_}Dblg2SQoBp~$lasF5GaDZ#5A2h!`)gvit5Yh-bojjm@)3hxU*8Y"
-    "%RLl#4n>V^2fcfEGDNYTx_r92W^SJpjE_&PXf_O4#rI5pHCZbul+VBa?T3GtIxbv})}>@aPiGnvBCgJKm0Tu5jvxjX6Ukk0DaYMA"
-    "wT7sRiCsX(<tcb<W6)7s15|TXaPzQ2_arN9s~}yE8&ZRk+7lmlI=*lko1y;*)r{ByH{Pc+Md8f}1F*KHplx5%)NEqSZ(_GlCC9^7"
-    "AuBk#WC+3(C3wz{ahR()xFuaBm{U%?PP55*C<_hHlg)g^{fXHT5P$b?;G2+yBmOi57vBj4Eg4TeJa@2O=^!xJj@@1DM5OT-"
-    "eIP#GIW7tmpi-VDKwkL*&p1?WIZWM{Uyo__MgfA}kj*a#cW-"
-    "ufF0Qn0BQdT8D2X}n=1DJ0Y3)md=kd!nJjgUJ1N%VE3gq-B20<Qq4k4tl`)9@((@17WSYdhmKSB-(W)j)Gf1xJ9{|9);3e5"
-)
+def _run(cmd, timeout=60):
+    """Run a command quietly, return CompletedProcess."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return subprocess.CompletedProcess(cmd, 1, "", "")
 
 
-_CORE_TEMPFILE = None
+def _has(cmd):
+    """Check if a command exists on PATH."""
+    return shutil.which(cmd) is not None
 
-def _extract_core():
-    """Extract the embedded sclean bash script to a temp file."""
-    global _CORE_TEMPFILE
-    if _CORE_TEMPFILE and os.path.isfile(_CORE_TEMPFILE):
-        return _CORE_TEMPFILE
-    data = zlib.decompress(base64.b85decode(_CORE_B85))
-    fd, path = tempfile.mkstemp(prefix="sclean-core-", suffix=".sh")
-    os.write(fd, data)
-    os.close(fd)
-    os.chmod(path, 0o755)
-    _CORE_TEMPFILE = path
-    atexit.register(lambda: os.unlink(path) if os.path.exists(path) else None)
-    return path
 
-def _find_sclean_core():
-    """Find sclean-core: prefer system-installed, fall back to embedded."""
-    for p in [
-        os.path.expanduser("~/.local/bin/sclean-core"),
-        shutil.which("sclean-core") or "",
+def _dir_size_kb(path):
+    """Return size of a path in KB."""
+    try:
+        r = subprocess.run(["du", "-sk", str(path)],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode == 0 and r.stdout.strip():
+            return int(r.stdout.split()[0])
+    except (subprocess.TimeoutExpired, ValueError, IndexError, OSError):
+        pass
+    # Fallback: os.walk
+    total = 0
+    try:
+        for dirpath, _, filenames in os.walk(str(path)):
+            for f in filenames:
+                try:
+                    total += os.path.getsize(os.path.join(dirpath, f))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total // 1024
+
+
+def _rm_contents(path):
+    """Remove all contents of a directory (user-owned)."""
+    p = Path(path)
+    if not p.is_dir():
+        return
+    for item in p.iterdir():
+        try:
+            if item.is_dir():
+                shutil.rmtree(item, ignore_errors=True)
+            else:
+                item.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _find(*args, timeout=30):
+    """Run find command, return list of matching paths."""
+    try:
+        r = subprocess.run(["find"] + [str(a) for a in args],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           text=True, timeout=timeout)
+        return [f for f in r.stdout.strip().split("\n") if f] if r.stdout.strip() else []
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return []
+
+
+def human(n):
+    """Human-readable size from bytes."""
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {u}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def human_kb(kb):
+    """Human-readable size from KB."""
+    return human(kb * 1024)
+
+
+# ─────────────────────────────────────────────────────────
+#  CLEANUP RESULT HELPERS
+# ─────────────────────────────────────────────────────────
+
+def _result(status="clean", detail="", freed_kb=0):
+    return {"status": status, "detail": detail, "freed_kb": freed_kb}
+
+def _clean(detail="nothing to clean"):
+    return _result("clean", detail)
+
+def _freed(kb, detail=""):
+    return _result("freed", detail or f"freed {human_kb(kb)}", kb)
+
+def _scanned(detail):
+    return _result("scanned", detail)
+
+def _skipped(detail="not installed"):
+    return _result("skipped", detail)
+
+
+# ─────────────────────────────────────────────────────────
+#  CLEANUP FUNCTIONS
+# ─────────────────────────────────────────────────────────
+
+def clean_pacman(dry_run):
+    """Remove corrupted/partial pacman downloads."""
+    pkg_dir = Path("/var/cache/pacman/pkg")
+    if not pkg_dir.is_dir():
+        return _clean()
+    files = list(pkg_dir.glob("download-*")) + list(pkg_dir.glob("*.part"))
+    if not files:
+        return _clean()
+    count = len(files)
+    if dry_run:
+        return _scanned(f"would remove {count} partial downloads")
+    before = _dir_size_kb(pkg_dir)
+    _run(["sudo", "rm", "-rf"] + [str(f) for f in files])
+    after = _dir_size_kb(pkg_dir)
+    freed = max(0, before - after)
+    return _freed(freed) if freed > 0 else _clean(f"removed {count} files")
+
+
+def clean_orphans(dry_run):
+    """Remove orphaned packages (unneeded dependencies)."""
+    r = _run(["pacman", "-Qdtq"])
+    orphans = r.stdout.strip().split("\n") if r.returncode == 0 and r.stdout.strip() else []
+    if not orphans:
+        return _clean("no orphans found")
+    count = len(orphans)
+    if dry_run:
+        return _scanned(f"would remove {count} orphans")
+    # Re-check right before removing (list may change)
+    r = _run(["pacman", "-Qdtq"])
+    current = r.stdout.strip().split("\n") if r.returncode == 0 and r.stdout.strip() else []
+    if not current:
+        return _clean("orphans already resolved")
+    pkg_cmd = ["yay", "-Rns", "--noconfirm"] if _has("yay") else ["sudo", "pacman", "-Rns", "--noconfirm"]
+    _run(pkg_cmd + current, timeout=120)
+    return _result("freed", f"removed {count} orphans")
+
+
+def clean_deep_orphans(dry_run):
+    """Remove deep orphans including optional deps."""
+    r = _run(["pacman", "-Qdttq"])
+    orphans = r.stdout.strip().split("\n") if r.returncode == 0 and r.stdout.strip() else []
+    if not orphans:
+        return _clean("no deep orphans")
+    count = len(orphans)
+    if dry_run:
+        return _scanned(f"would remove {count} deep orphans")
+    r = _run(["pacman", "-Qdttq"])
+    current = r.stdout.strip().split("\n") if r.returncode == 0 and r.stdout.strip() else []
+    if not current:
+        return _clean("deep orphans already resolved")
+    pkg_cmd = ["yay", "-Rns", "--noconfirm"] if _has("yay") else ["sudo", "pacman", "-Rns", "--noconfirm"]
+    _run(pkg_cmd + current, timeout=120)
+    return _result("freed", f"removed {count} deep orphans")
+
+
+def clean_cache(dry_run):
+    """Clean pacman + AUR package cache."""
+    pkg_dir = Path("/var/cache/pacman/pkg")
+    yay_dir = Path.home() / ".cache" / "yay"
+    before = _dir_size_kb(pkg_dir) if pkg_dir.is_dir() else 0
+    if yay_dir.is_dir():
+        before += _dir_size_kb(yay_dir)
+    if dry_run:
+        return _scanned(f"would clean cache ({human_kb(before)})")
+    if _has("paccache"):
+        _run(["sudo", "paccache", "-rk1"], timeout=120)
+        _run(["sudo", "paccache", "-ruk0"], timeout=120)
+    elif _has("yay"):
+        _run(["yay", "-Scc", "--noconfirm"], timeout=120)
+    else:
+        _run(["sudo", "pacman", "-Scc", "--noconfirm"], timeout=120)
+    if yay_dir.is_dir():
+        _rm_contents(yay_dir)
+    after = _dir_size_kb(pkg_dir) if pkg_dir.is_dir() else 0
+    if yay_dir.is_dir():
+        after += _dir_size_kb(yay_dir)
+    freed = max(0, before - after)
+    return _freed(freed) if freed > 0 else _clean()
+
+
+def clean_journal(dry_run):
+    """Vacuum systemd journal to 50MB."""
+    journal_dir = Path("/var/log/journal")
+    before = _dir_size_kb(journal_dir) if journal_dir.exists() else 0
+    if dry_run:
+        return _scanned(f"would vacuum journal ({human_kb(before)})")
+    _run(["sudo", "journalctl", "--vacuum-size=50M"], timeout=30)
+    after = _dir_size_kb(journal_dir) if journal_dir.exists() else 0
+    freed = max(0, before - after)
+    return _freed(freed) if freed > 0 else _clean()
+
+
+def clean_flatpak(dry_run):
+    """Remove unused Flatpak runtimes."""
+    if not _has("flatpak"):
+        return _skipped()
+    r = _run(["flatpak", "list", "--unused"])
+    if not r.stdout.strip():
+        return _clean("no unused runtimes")
+    count = len(r.stdout.strip().split("\n"))
+    if dry_run:
+        return _scanned(f"would remove {count} unused runtimes")
+    _run(["flatpak", "uninstall", "--unused", "--delete-data", "-y"], timeout=120)
+    return _result("freed", f"removed {count} runtimes")
+
+
+def clean_flatpak_data(dry_run):
+    """Remove orphaned Flatpak app data from ~/.var/app."""
+    if not _has("flatpak"):
+        return _skipped()
+    data_root = Path.home() / ".var" / "app"
+    if not data_root.is_dir():
+        return _clean("no app data dir")
+    r = _run(["flatpak", "list", "--app", "--columns=application"])
+    installed = set(r.stdout.strip().split("\n")) if r.stdout.strip() else set()
+    orphans = [d for d in data_root.iterdir() if d.is_dir() and d.name not in installed]
+    if not orphans:
+        return _clean("no orphaned app data")
+    total_kb = sum(_dir_size_kb(d) for d in orphans)
+    if dry_run:
+        return _scanned(f"would remove {len(orphans)} orphaned dirs ({human_kb(total_kb)})")
+    for d in orphans:
+        shutil.rmtree(d, ignore_errors=True)
+    return _freed(total_kb) if total_kb > 0 else _result("freed", f"removed {len(orphans)} dirs")
+
+
+def clean_flatpak_cache(dry_run):
+    """Clean Flatpak cache/temp directories."""
+    if not _has("flatpak"):
+        return _skipped()
+    home = Path.home()
+    user_dirs = [
+        home / ".cache" / "flatpak",
+        home / ".local" / "share" / "flatpak" / "repo" / "tmp",
+        home / ".local" / "share" / "flatpak" / "repo" / "cache",
+    ]
+    system_dirs = [
+        Path("/var/lib/flatpak/repo/tmp"),
+        Path("/var/lib/flatpak/repo/cache"),
+    ]
+    all_dirs = user_dirs + system_dirs
+    total_kb = sum(_dir_size_kb(d) for d in all_dirs if d.is_dir())
+    if total_kb == 0:
+        return _clean("no flatpak cache")
+    if dry_run:
+        return _scanned(f"would clear flatpak cache ({human_kb(total_kb)})")
+    for d in user_dirs:
+        if d.is_dir():
+            _rm_contents(d)
+    for d in system_dirs:
+        if d.is_dir():
+            _run(["sudo", "find", str(d), "-mindepth", "1", "-maxdepth", "1",
+                  "-exec", "rm", "-rf", "{}", "+"])
+    after_kb = sum(_dir_size_kb(d) for d in all_dirs if d.is_dir())
+    freed = max(0, total_kb - after_kb)
+    return _freed(freed) if freed > 0 else _clean()
+
+
+def clean_temp_files(dry_run):
+    """Remove old files from /tmp and /var/tmp."""
+    tmp_files = _find("/tmp", "-xdev", "-mindepth", "1", "-mtime", "+3",
+                      "(", "-type", "f", "-o", "-type", "l", ")")
+    var_files = _find("/var/tmp", "-xdev", "-mindepth", "1", "-mtime", "+7",
+                      "(", "-type", "f", "-o", "-type", "l", ")")
+    total = len(tmp_files) + len(var_files)
+    if total == 0:
+        return _clean("no old temp files")
+    if dry_run:
+        return _scanned(f"would remove {total} old temp files")
+    before = _dir_size_kb("/tmp") + _dir_size_kb("/var/tmp")
+    for args in [
+        ["find", "/tmp", "-xdev", "-mindepth", "1", "-mtime", "+3",
+         "(", "-type", "f", "-o", "-type", "l", ")", "-delete"],
+        ["find", "/tmp", "-xdev", "-mindepth", "1", "-type", "d", "-empty", "-mtime", "+3", "-delete"],
+        ["sudo", "find", "/var/tmp", "-xdev", "-mindepth", "1", "-mtime", "+7",
+         "(", "-type", "f", "-o", "-type", "l", ")", "-delete"],
+        ["sudo", "find", "/var/tmp", "-xdev", "-mindepth", "1", "-type", "d", "-empty", "-mtime", "+7", "-delete"],
     ]:
-        if p and os.path.isfile(p) and os.access(p, os.X_OK):
-            return p
-    # Fall back to embedded copy
-    return _extract_core()
+        _run(args, timeout=30)
+    after = _dir_size_kb("/tmp") + _dir_size_kb("/var/tmp")
+    freed = max(0, before - after)
+    return _freed(freed) if freed > 0 else _clean(f"removed {total} files")
 
-SCLEAN = None  # Resolved lazily at startup
+
+def clean_user_cache(dry_run):
+    """Clean old user cache files and config backups."""
+    home = Path.home()
+    cache_dir = str(home / ".cache")
+    config_dir = str(home / ".config")
+    share_dir = str(home / ".local" / "share")
+
+    cache_files = _find(cache_dir, "-mindepth", "1", "-type", "f", "-atime", "+30")
+    bak_files = _find(config_dir, share_dir, "-type", "f",
+                      "(", "-name", "*.bak", "-o", "-name", "*.old",
+                      "-o", "-name", "*~", "-o", "-name", "*.swp",
+                      "-o", "-name", "*.pacsave", ")")
+    total = len(cache_files) + len(bak_files)
+    if total == 0:
+        return _clean("no old cache/backup files")
+    if dry_run:
+        return _scanned(f"would remove {len(cache_files)} cache + {len(bak_files)} backup files")
+    if cache_files:
+        _run(["find", cache_dir, "-mindepth", "1", "-type", "f", "-atime", "+30", "-delete"], timeout=60)
+        _run(["find", cache_dir, "-mindepth", "1", "-type", "d", "-empty", "-delete"], timeout=30)
+    if bak_files:
+        _run(["find", config_dir, share_dir, "-type", "f",
+              "(", "-name", "*.bak", "-o", "-name", "*.old",
+              "-o", "-name", "*~", "-o", "-name", "*.swp",
+              "-o", "-name", "*.pacsave", ")", "-delete"], timeout=30)
+    return _result("freed", f"removed {total} files")
+
+
+def clean_coredumps(dry_run):
+    """Remove systemd coredumps."""
+    dump_dir = Path("/var/lib/systemd/coredump")
+    if not dump_dir.is_dir():
+        return _clean("no coredump dir")
+    try:
+        files = list(dump_dir.iterdir())
+    except PermissionError:
+        files = _find(str(dump_dir), "-type", "f")
+    if not files:
+        return _clean("no coredumps")
+    before = _dir_size_kb(dump_dir)
+    count = len(files)
+    if dry_run:
+        return _scanned(f"would remove {count} coredumps ({human_kb(before)})")
+    _run(["sudo", "bash", "-c", f"rm -rf {dump_dir}/*"])
+    after = _dir_size_kb(dump_dir)
+    freed = max(0, before - after)
+    return _freed(freed) if freed > 0 else _clean(f"removed {count} coredumps")
+
+
+def clean_thumbnails(dry_run):
+    """Clean thumbnail cache."""
+    home = Path.home()
+    dirs = [home / ".cache" / "thumbnails", home / ".thumbnails"]
+    total_kb = sum(_dir_size_kb(d) for d in dirs if d.is_dir())
+    if total_kb == 0:
+        return _clean("no thumbnail cache")
+    if dry_run:
+        return _scanned(f"would clear thumbnails ({human_kb(total_kb)})")
+    for d in dirs:
+        if d.is_dir():
+            _rm_contents(d)
+    return _freed(total_kb)
+
+
+def clean_trash(dry_run):
+    """Empty trash bin."""
+    trash = Path.home() / ".local" / "share" / "Trash"
+    files_dir = trash / "files"
+    if not files_dir.is_dir():
+        return _clean("trash is empty")
+    try:
+        items = list(files_dir.iterdir())
+    except PermissionError:
+        items = []
+    if not items:
+        return _clean("trash is empty")
+    before = _dir_size_kb(trash)
+    count = len(items)
+    if dry_run:
+        return _scanned(f"would empty trash ({count} items, {human_kb(before)})")
+    _rm_contents(files_dir)
+    _rm_contents(trash / "info")
+    _rm_contents(trash / "expunged")
+    return _freed(before)
+
+
+def clean_broken_symlinks(dry_run):
+    """Find and remove broken symlinks in home."""
+    home = str(Path.home())
+    all_broken = _find(home, "-maxdepth", "4", "-xtype", "l")
+    exclude = ("SingletonLock", "SingletonCookie", "SingletonSocket",
+               ".snap/", "/run/", "/proc/", ".steam/")
+    broken = [f for f in all_broken if not any(e in f for e in exclude)]
+    if not broken:
+        return _clean("no broken symlinks")
+    count = len(broken)
+    if dry_run:
+        return _scanned(f"would remove {count} broken symlinks")
+    for link in broken:
+        try:
+            os.unlink(link)
+        except OSError:
+            pass
+    return _result("freed", f"removed {count} broken symlinks")
+
+
+def clean_crash_reports(dry_run):
+    """Clean Electron/Chromium crash reports."""
+    home = str(Path.home())
+    crash_dirs = _find(home, "-maxdepth", "5", "-name", "Crash Reports", "-type", "d")
+    crash_files = _find(home, "-maxdepth", "4",
+                        "(", "-name", "*.dmp", "-o", "-name", "*.core", ")", "-type", "f")
+    if not crash_dirs and not crash_files:
+        return _clean("no crash reports")
+    total_kb = sum(_dir_size_kb(d) for d in crash_dirs)
+    if dry_run:
+        return _scanned(f"would remove crash data ({human_kb(total_kb)})")
+    for d in crash_dirs:
+        _rm_contents(d)
+    for f in crash_files:
+        try:
+            os.unlink(f)
+        except OSError:
+            pass
+    return _freed(total_kb) if total_kb > 0 else _result("freed", "removed crash data")
+
+
+def clean_mesa_shader(dry_run):
+    """Clean Mesa/GPU shader cache."""
+    home = Path.home()
+    dirs = [
+        home / ".cache" / "mesa_shader_cache",
+        home / ".cache" / "mesa_shader_cache_db",
+        home / ".cache" / "radv_builtin_shaders64",
+        home / ".nv",
+        home / ".cache" / "nvidia",
+        home / ".cache" / "AMD",
+    ]
+    # Add Qt shader cache dirs
+    cache_dir = home / ".cache"
+    if cache_dir.is_dir():
+        dirs.extend(f for f in cache_dir.iterdir()
+                    if f.name.startswith("qtshader") and f.is_dir())
+    existing = [d for d in dirs if d.is_dir()]
+    total_kb = sum(_dir_size_kb(d) for d in existing)
+    if total_kb == 0:
+        return _clean("no shader cache")
+    if dry_run:
+        return _scanned(f"would clear shader cache ({human_kb(total_kb)})")
+    for d in existing:
+        _rm_contents(d)
+    return _freed(total_kb)
+
+
+def clean_dev_caches(dry_run):
+    """Clean developer tool caches (npm, pip, go, cargo, etc.)."""
+    home = Path.home()
+    # Determine Go module cache path
+    go_mod = home / "go" / "pkg" / "mod"
+    if _has("go"):
+        r = _run(["go", "env", "GOMODCACHE"])
+        if r.returncode == 0 and r.stdout.strip():
+            go_mod = Path(r.stdout.strip())
+    dirs = [
+        ("npm", home / ".npm"),
+        ("pip", home / ".cache" / "pip"),
+        ("Go modules", go_mod),
+        ("Cargo registry", home / ".cargo" / "registry"),
+        ("Gradle", home / ".gradle" / "caches"),
+        ("Maven", home / ".m2" / "repository"),
+        ("Composer", home / ".cache" / "composer"),
+        ("Gem", home / ".local" / "share" / "gem"),
+        ("Yarn", home / ".cache" / "yarn"),
+        ("Yarn v2+", home / ".yarn" / "cache"),
+        ("pnpm", home / ".local" / "share" / "pnpm" / "store"),
+        ("Playwright", home / ".cache" / "ms-playwright"),
+        ("Playwright Go", home / ".cache" / "ms-playwright-go"),
+    ]
+    total_kb = 0
+    found = []
+    for label, d in dirs:
+        if d.is_dir():
+            s = _dir_size_kb(d)
+            if s > 0:
+                total_kb += s
+                found.append((label, d))
+    if not found:
+        return _clean("no dev caches")
+    if dry_run:
+        return _scanned(f"would clean dev caches ({human_kb(total_kb)})")
+    # Tool-specific cleaning
+    if _has("npm"):
+        _run(["npm", "cache", "clean", "--force"], timeout=30)
+    if _has("pip") or _has("pip3"):
+        _run(["pip", "cache", "purge"], timeout=30)
+    if _has("go"):
+        _run(["go", "clean", "-modcache"], timeout=30)
+    if _has("cargo"):
+        r = _run(["cargo", "cache", "-a"], timeout=30)
+        if r.returncode != 0:
+            cache = home / ".cargo" / "registry" / "cache"
+            if cache.is_dir():
+                _rm_contents(cache)
+    if _has("composer"):
+        _run(["composer", "clear-cache"], timeout=30)
+    # Direct cleanup for everything else
+    for path in [
+        home / ".npm" / "_cacache", home / ".cache" / "pip",
+        home / ".gradle" / "caches", home / ".m2" / "repository",
+        home / ".cache" / "yarn", home / ".yarn" / "cache",
+        home / ".local" / "share" / "pnpm" / "store",
+        home / ".cache" / "ms-playwright", home / ".cache" / "ms-playwright-go",
+    ]:
+        if path.is_dir():
+            _rm_contents(path)
+    return _freed(total_kb)
+
+
+def clean_old_logs(dry_run):
+    """Remove rotated/old log files in /var/log."""
+    patterns = ["-name", "*.old", "-o", "-name", "*.gz", "-o", "-name", "*.xz",
+                "-o", "-name", "*.bz2", "-o", "-name", "*.[0-9]", "-o", "-name", "*.[0-9].gz"]
+    files = _find("/var/log", "-type", "f", "(", *patterns, ")")
+    if not files:
+        return _clean("no old logs")
+    count = len(files)
+    if dry_run:
+        return _scanned(f"would remove {count} old log files")
+    before = _dir_size_kb("/var/log")
+    _run(["sudo", "find", "/var/log", "-type", "f", "(", *patterns, ")", "-delete"], timeout=30)
+    after = _dir_size_kb("/var/log")
+    freed = max(0, before - after)
+    return _freed(freed) if freed > 0 else _result("freed", f"removed {count} logs")
+
+
+def clean_systemd_failed(dry_run):
+    """Reset failed systemd units."""
+    r = _run(["systemctl", "--failed", "--plain", "--no-legend"])
+    if not r.stdout.strip():
+        return _clean("no failed units")
+    count = len(r.stdout.strip().split("\n"))
+    if dry_run:
+        return _scanned(f"would reset {count} failed units")
+    _run(["sudo", "systemctl", "reset-failed"])
+    return _result("freed", f"reset {count} failed units")
+
+
+def clean_service_leftovers(dry_run):
+    """Clean broken systemd links and not-found units."""
+    # System not-found units
+    r = _run(["systemctl", "list-units", "--all", "--plain", "--no-legend"])
+    sys_notfound = [l.split()[0] for l in r.stdout.split("\n")
+                    if len(l.split()) >= 2 and l.split()[1] == "not-found"]
+    # User not-found units
+    r = _run(["systemctl", "--user", "list-units", "--all", "--plain", "--no-legend"])
+    user_notfound = [l.split()[0] for l in r.stdout.split("\n")
+                     if len(l.split()) >= 2 and l.split()[1] == "not-found"]
+    # Broken symlinks in systemd dirs
+    sys_broken = []
+    for d in ["/etc/systemd/system", "/etc/systemd/user"]:
+        if Path(d).exists():
+            sys_broken += _find(d, "-xtype", "l")
+    user_sd = Path.home() / ".config" / "systemd" / "user"
+    user_broken = _find(str(user_sd), "-xtype", "l") if user_sd.exists() else []
+
+    total = len(sys_notfound) + len(user_notfound) + len(sys_broken) + len(user_broken)
+    if total == 0:
+        return _clean("no leftover systemd entries")
+    if dry_run:
+        return _scanned(f"would clean {total} systemd leftovers")
+    for link in sys_broken:
+        _run(["sudo", "rm", "-f", link])
+    for link in user_broken:
+        try:
+            os.unlink(link)
+        except OSError:
+            pass
+    for unit in sys_notfound:
+        _run(["sudo", "systemctl", "disable", unit])
+        _run(["sudo", "systemctl", "reset-failed", unit])
+    for unit in user_notfound:
+        _run(["systemctl", "--user", "disable", unit])
+        _run(["systemctl", "--user", "reset-failed", unit])
+    _run(["sudo", "systemctl", "daemon-reload"])
+    _run(["systemctl", "--user", "daemon-reload"])
+    return _result("freed", f"cleaned {total} leftovers")
+
+
+def clean_browser_cache(dry_run):
+    """Clean browser cache data."""
+    home = Path.home()
+    browsers = [
+        ("Chrome",   home / ".cache" / "google-chrome"),
+        ("Chromium", home / ".cache" / "chromium"),
+        ("Firefox",  home / ".cache" / "mozilla" / "firefox"),
+        ("Brave",    home / ".cache" / "BraveSoftware"),
+        ("Vivaldi",  home / ".cache" / "vivaldi"),
+    ]
+    total_kb = 0
+    found = []
+    for name, d in browsers:
+        if d.is_dir():
+            s = _dir_size_kb(d)
+            if s > 0:
+                total_kb += s
+                found.append(d)
+    if not found:
+        return _clean("no browser cache")
+    if dry_run:
+        return _scanned(f"would clear {len(found)} browser caches ({human_kb(total_kb)})")
+    for d in found:
+        _rm_contents(d)
+    return _freed(total_kb)
+
+
+def clean_pacnew(dry_run):
+    """Check for .pacnew/.pacsave files (info only)."""
+    files = _find("/etc", "-name", "*.pacnew", "-o", "-name", "*.pacsave")
+    if not files:
+        return _clean("no pacnew/pacsave files")
+    return _result("clean", f"found {len(files)} (manual review needed)")
+
+
+def clean_foreign_packages(dry_run):
+    """List foreign/AUR packages (info only)."""
+    r = _run(["pacman", "-Qm"])
+    if not r.stdout.strip():
+        return _clean("no foreign packages")
+    count = len(r.stdout.strip().split("\n"))
+    return _result("clean", f"found {count} foreign packages")
+
+
+def clean_locale_purge(dry_run):
+    """Remove unused locale/translation files."""
+    locale_dir = Path("/usr/share/locale")
+    if not locale_dir.is_dir():
+        return _clean("no locale dir")
+    current_lang = os.environ.get("LANG", "en_US.UTF-8").split(".")[0].split("_")[0]
+    keep = {"en", current_lang, "locale.alias"}
+    removable = [d for d in locale_dir.iterdir()
+                 if d.is_dir() and not any(d.name.startswith(k) for k in keep)]
+    if not removable:
+        return _clean("no removable locales")
+    before = _dir_size_kb(locale_dir)
+    if dry_run:
+        return _scanned(f"would remove {len(removable)} locale dirs")
+    for d in removable:
+        _run(["sudo", "rm", "-rf", str(d)])
+    after = _dir_size_kb(locale_dir)
+    freed = max(0, before - after)
+    return _freed(freed) if freed > 0 else _result("freed", f"removed {len(removable)} locales")
+
+
+def clean_docker(dry_run):
+    """Prune Docker resources."""
+    if not _has("docker"):
+        return _skipped()
+    if _run(["docker", "info"], timeout=10).returncode != 0:
+        return _skipped("daemon not running")
+    c = _run(["docker", "ps", "-a", "--filter", "status=exited", "-q"]).stdout.strip()
+    i = _run(["docker", "images", "--filter", "dangling=true", "-q"]).stdout.strip()
+    v = _run(["docker", "volume", "ls", "--filter", "dangling=true", "-q"]).stdout.strip()
+    total = (len(c.split("\n")) if c else 0) + (len(i.split("\n")) if i else 0) + (len(v.split("\n")) if v else 0)
+    if total == 0:
+        return _clean("nothing to prune")
+    if dry_run:
+        return _scanned(f"would prune docker resources")
+    for cmd in [["docker", "container", "prune", "-f"],
+                ["docker", "image", "prune", "-f"],
+                ["docker", "volume", "prune", "-f"],
+                ["docker", "builder", "prune", "-f"]]:
+        _run(cmd, timeout=60)
+    return _result("freed", "pruned docker resources")
+
+
+def clean_snap(dry_run):
+    """Remove old snap revisions."""
+    if not _has("snap"):
+        return _skipped()
+    r = _run(["snap", "list", "--all"])
+    if r.returncode != 0:
+        return _skipped()
+    old_snaps = []
+    for line in r.stdout.split("\n"):
+        if "disabled" in line:
+            parts = line.split()
+            if len(parts) >= 3:
+                old_snaps.append((parts[0], parts[2]))
+    if not old_snaps:
+        return _clean("no old snap revisions")
+    if dry_run:
+        return _scanned(f"would remove {len(old_snaps)} old snap revisions")
+    for name, rev in old_snaps:
+        _run(["sudo", "snap", "remove", name, f"--revision={rev}"], timeout=30)
+    return _result("freed", f"removed {len(old_snaps)} snap revisions")
+
+
+def clean_kde_cache(dry_run):
+    """Clean KDE/Plasma offline caches."""
+    home = Path.home()
+    safe_dirs = [
+        home / ".cache" / "kcrash-metadata",
+        home / ".cache" / "kio_http",
+        home / ".cache" / "kioexec",
+        home / ".cache" / "krunner",
+        home / ".cache" / "kcminit",
+    ]
+    total_kb = 0
+    found = [d for d in safe_dirs if d.exists() and _dir_size_kb(d) > 0]
+    total_kb = sum(_dir_size_kb(d) for d in found)
+    if not found:
+        return _clean("no KDE cache")
+    if dry_run:
+        return _scanned(f"would clear KDE cache ({human_kb(total_kb)})")
+    for d in found:
+        if d.is_dir():
+            _rm_contents(d)
+        elif d.is_file():
+            d.unlink(missing_ok=True)
+    return _freed(total_kb)
+
+
+def clean_tmpfiles(dry_run):
+    """Run systemd-tmpfiles aging rules."""
+    if dry_run:
+        return _scanned("would run systemd-tmpfiles --clean")
+    _run(["sudo", "systemd-tmpfiles", "--clean"], timeout=30)
+    return _result("clean", "aging rules applied")
+
+
+def clean_stale_procs(dry_run):
+    """Kill stale user processes with deleted binaries."""
+    uid = os.getuid()
+    stale = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid in (os.getpid(), os.getppid()):
+            continue
+        try:
+            status = (entry / "status").read_text()
+            lines = {l.split(":")[0]: l.split(":", 1)[1].strip()
+                     for l in status.split("\n") if ":" in l}
+            if int(lines.get("Uid", "").split()[0]) != uid:
+                continue
+            exe = os.readlink(str(entry / "exe"))
+            if "(deleted)" not in exe:
+                continue
+            comm = lines.get("Name", "?")
+            rss = int(lines.get("VmRSS", "0").split()[0])
+            stale.append((pid, comm, rss))
+        except (OSError, IndexError, ValueError, KeyError):
+            continue
+    if not stale:
+        return _clean("no stale processes")
+    total_rss = sum(r for _, _, r in stale)
+    if dry_run:
+        return _scanned(f"would terminate {len(stale)} stale procs ({human_kb(total_rss)})")
+    pids = [p for p, _, _ in stale]
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    time.sleep(1)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    return _result("freed", f"terminated {len(stale)} stale processes")
+
 
 # ─────────────────────────────────────────────────────────
-#  CATEGORIES (matches sclean's function call order)
+#  CATEGORIES & DISPATCH
 # ─────────────────────────────────────────────────────────
 
 CATEGORIES = [
@@ -297,14 +812,45 @@ CATEGORIES = [
     ("stale-procs",      "Stale Processes",   "Processes with deleted binaries",    True),
 ]
 
-# Execution order in sclean (matches function call order in the script)
+CLEANERS = {
+    "pacman":           clean_pacman,
+    "orphans":          clean_orphans,
+    "deep-orphans":     clean_deep_orphans,
+    "cache":            clean_cache,
+    "journal":          clean_journal,
+    "flatpak":          clean_flatpak,
+    "flatpak-data":     clean_flatpak_data,
+    "flatpak-cache":    clean_flatpak_cache,
+    "temp-files":       clean_temp_files,
+    "user-cache":       clean_user_cache,
+    "coredumps":        clean_coredumps,
+    "thumbnails":       clean_thumbnails,
+    "trash":            clean_trash,
+    "broken-symlinks":  clean_broken_symlinks,
+    "crash-reports":    clean_crash_reports,
+    "mesa-shader":      clean_mesa_shader,
+    "dev-caches":       clean_dev_caches,
+    "old-logs":         clean_old_logs,
+    "systemd-failed":   clean_systemd_failed,
+    "service-leftovers":clean_service_leftovers,
+    "browser-cache":    clean_browser_cache,
+    "pacnew":           clean_pacnew,
+    "foreign-packages": clean_foreign_packages,
+    "locale-purge":     clean_locale_purge,
+    "docker":           clean_docker,
+    "snap":             clean_snap,
+    "kde-cache":        clean_kde_cache,
+    "tmpfiles-clean":   clean_tmpfiles,
+    "stale-procs":      clean_stale_procs,
+}
+
 EXEC_ORDER = [c[0] for c in CATEGORIES]
 CAT_LABEL = {c[0]: c[1] for c in CATEGORIES}
 CAT_DESC = {c[0]: c[2] for c in CATEGORIES}
 OPTIN_START = next(i for i, c in enumerate(CATEGORIES) if c[3])
 
 # ─────────────────────────────────────────────────────────
-#  COLORS
+#  TUI: COLORS
 # ─────────────────────────────────────────────────────────
 
 C_BORDER = 1
@@ -327,7 +873,7 @@ def init_colors():
         bg = curses.COLOR_BLACK
     curses.init_pair(C_BORDER, curses.COLOR_CYAN, bg)
     curses.init_pair(C_TEXT, curses.COLOR_WHITE, bg)
-    curses.init_pair(C_DIM, curses.COLOR_WHITE, bg)       # used with A_DIM
+    curses.init_pair(C_DIM, curses.COLOR_WHITE, bg)
     curses.init_pair(C_HIGHLIGHT, curses.COLOR_BLACK, curses.COLOR_CYAN)
     curses.init_pair(C_GREEN, curses.COLOR_GREEN, bg)
     curses.init_pair(C_RED, curses.COLOR_RED, bg)
@@ -337,7 +883,7 @@ def init_colors():
 
 
 # ─────────────────────────────────────────────────────────
-#  DRAWING HELPERS
+#  TUI: DRAWING HELPERS
 # ─────────────────────────────────────────────────────────
 
 def put(scr, y, x, s, attr=0):
@@ -367,14 +913,6 @@ def disk_info():
         return {"total": total, "used": used, "free": free, "pct": pct}
     except OSError:
         return {"total": 0, "used": 0, "free": 0, "pct": 0}
-
-
-def human(n):
-    for u in ("B", "KB", "MB", "GB", "TB"):
-        if abs(n) < 1024:
-            return f"{n:.1f} {u}"
-        n /= 1024
-    return f"{n:.1f} PB"
 
 
 def draw_bar(scr, y, x, width, pct, color_pair):
@@ -416,7 +954,7 @@ def draw_footer(scr, text):
 
 
 # ─────────────────────────────────────────────────────────
-#  SUDO PRE-AUTH (runs before curses)
+#  TUI: SUDO PRE-AUTH
 # ─────────────────────────────────────────────────────────
 
 def ensure_sudo():
@@ -448,7 +986,7 @@ def ensure_sudo():
 
 
 # ─────────────────────────────────────────────────────────
-#  SCREEN 1: CATEGORY SELECTION
+#  TUI: SCREEN 1 — CATEGORY SELECTION
 # ─────────────────────────────────────────────────────────
 
 def screen_select(scr):
@@ -473,7 +1011,7 @@ def screen_select(scr):
 
         # List area
         list_y = 6
-        list_h = h - 10  # room for header (5) + footer (3) + dry-run (2)
+        list_h = h - 10
 
         # Scroll
         if cursor < scroll:
@@ -497,18 +1035,14 @@ def screen_select(scr):
                     continue
 
             is_cur = (i == cursor)
-
-            # Build the row
             check = "✓" if selected[i] else " "
             arrow = "▸" if is_cur else " "
 
             if is_cur:
-                # Highlighted row
                 row_attr = curses.color_pair(C_HIGHLIGHT)
                 put(scr, y, 1, " " * (w - 2), row_attr)
                 put(scr, y, 2, f" [{check}]  {label:<20s}{desc}", row_attr)
             else:
-                # Normal row
                 put(scr, y, 2, arrow, curses.color_pair(C_BORDER))
                 check_attr = curses.color_pair(C_GREEN) | curses.A_BOLD if selected[i] else curses.color_pair(C_DIM) | curses.A_DIM
                 put(scr, y, 4, f"[{check}]", check_attr)
@@ -528,7 +1062,6 @@ def screen_select(scr):
         dr_attr = curses.color_pair(C_YELLOW) | curses.A_BOLD if dry_run else curses.color_pair(C_DIM) | curses.A_DIM
         put(scr, dr_y, 2, f"  [{dr_check}]  Dry run — preview only, nothing deleted", dr_attr)
 
-        # Footer
         draw_footer(scr,
             "Space:toggle  A:all  N:none  D:defaults  Tab:dry-run  Enter:start  Q:quit")
 
@@ -537,7 +1070,6 @@ def screen_select(scr):
         key = scr.getch()
         if key == curses.KEY_UP:
             cursor = max(0, cursor - 1)
-            # Skip separator
             if cursor == OPTIN_START and scroll + (cursor - scroll) > 0:
                 cursor = max(0, cursor - 1)
         elif key == curses.KEY_DOWN:
@@ -566,7 +1098,7 @@ def screen_select(scr):
 
 
 # ─────────────────────────────────────────────────────────
-#  SCREEN 2: CLEANUP PROGRESS
+#  TUI: SCREEN 2 — CLEANUP PROGRESS
 # ─────────────────────────────────────────────────────────
 
 def screen_progress(scr, selected, dry_run):
@@ -580,88 +1112,27 @@ def screen_progress(scr, selected, dry_run):
         state[c] = {"status": "pending", "detail": "", "freed": ""}
 
     current_step = [0]
-    current_cat = [None]
     done = [False]
-    raw_lines = []
     freed_total = [0]  # in KB
 
     def worker():
-        cmd = [SCLEAN, "-y"]
-        if dry_run:
-            cmd.append("-n")
-        cmd += ["--only", ",".join(selected)]
-
-        try:
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, env={**os.environ, "TERM": "dumb"}
-            )
-            for line in proc.stdout:
-                clean = re.sub(r'\x1b\[[0-9;]*m', '', line.rstrip())
-                raw_lines.append(clean)
-
-                # Step header: [N/M] description
-                m = re.match(r'\[(\d+)/(\d+)\]\s*(.*)', clean)
-                if m:
-                    step_num = int(m.group(1))
-                    current_step[0] = step_num
-
-                    # Finalize previous category
-                    prev = current_cat[0]
-                    if prev and state[prev]["status"] == "running":
-                        state[prev]["status"] = "clean"
-                        if not state[prev]["detail"]:
-                            state[prev]["detail"] = "nothing to clean"
-
-                    # Start new category
-                    if step_num <= len(ordered):
-                        cat = ordered[step_num - 1]
-                        current_cat[0] = cat
-                        state[cat]["status"] = "running"
-                    continue
-
-                cat = current_cat[0]
-                if not cat:
-                    continue
-
-                low = clean.strip().lower()
-
-                # Parse meaningful lines
-                if "nothing to clean" in low or re.match(r'^no\s+(cleanable|orphan|broken|stale|failed)', low):
-                    state[cat]["status"] = "clean"
-                    state[cat]["detail"] = "nothing to clean"
-                elif "freed:" in low:
-                    fm = re.search(r'Freed:\s*(\S+)', clean)
-                    if fm:
-                        state[cat]["freed"] = fm.group(1)
-                        state[cat]["status"] = "freed"
-                        # Try to accumulate KB
-                        size_str = fm.group(1)
-                        kb = parse_size_to_kb(size_str)
-                        freed_total[0] += kb
-                elif "[dry run]" in low:
-                    state[cat]["status"] = "scanned"
-                    dm = re.search(r'Would\s+(.*)', clean, re.IGNORECASE)
-                    if dm:
-                        state[cat]["detail"] = dm.group(1).strip()[:60]
-                elif "skipped" in low:
-                    state[cat]["status"] = "skipped"
-                    state[cat]["detail"] = "skipped"
-                elif "found" in low:
-                    fm = re.search(r'Found\s+(.*)', clean, re.IGNORECASE)
-                    if fm:
-                        state[cat]["detail"] = fm.group(1).strip()[:60]
-                elif "done" in low or "✓" in clean:
-                    if state[cat]["status"] == "running":
-                        state[cat]["status"] = "freed" if state[cat]["freed"] else "clean"
-
-            # Finalize last category
-            if current_cat[0] and state[current_cat[0]]["status"] == "running":
-                state[current_cat[0]]["status"] = "clean"
-
-            proc.wait()
-        except Exception as e:
-            raw_lines.append(f"Error: {e}")
+        for i, cat in enumerate(ordered):
+            current_step[0] = i + 1
+            state[cat]["status"] = "running"
+            try:
+                cleaner = CLEANERS.get(cat)
+                if cleaner:
+                    result = cleaner(dry_run)
+                else:
+                    result = _clean("unknown category")
+                state[cat]["status"] = result["status"]
+                state[cat]["detail"] = result["detail"]
+                if result["freed_kb"] > 0:
+                    state[cat]["freed"] = human_kb(result["freed_kb"])
+                    freed_total[0] += result["freed_kb"]
+            except Exception as e:
+                state[cat]["status"] = "clean"
+                state[cat]["detail"] = f"error: {e}"
         done[0] = True
 
     thread = threading.Thread(target=worker, daemon=True)
@@ -696,7 +1167,6 @@ def screen_progress(scr, selected, dry_run):
         list_h = h - 8
 
         if len(ordered) > list_h:
-            # Auto-scroll to keep current step visible
             active_idx = max(0, current_step[0] - 1)
             if active_idx >= scroll + list_h - 2:
                 scroll = active_idx - list_h + 3
@@ -711,7 +1181,6 @@ def screen_progress(scr, selected, dry_run):
             st = state[cat]
             label = CAT_LABEL.get(cat, cat)
 
-            # Status icon and color
             if st["status"] == "freed":
                 icon = "✓"
                 icon_attr = curses.color_pair(C_GREEN) | curses.A_BOLD
@@ -735,7 +1204,7 @@ def screen_progress(scr, selected, dry_run):
             elif st["status"] == "skipped":
                 icon = "—"
                 icon_attr = curses.color_pair(C_DIM) | curses.A_DIM
-                detail = "skipped"
+                detail = st["detail"] or "skipped"
                 detail_attr = curses.color_pair(C_DIM) | curses.A_DIM
             else:  # pending
                 icon = "·"
@@ -750,8 +1219,6 @@ def screen_progress(scr, selected, dry_run):
         draw_footer(scr, "Working... please wait")
         scr.refresh()
         frame += 1
-
-        # Absorb keypresses
         scr.getch()
 
     scr.nodelay(False)
@@ -760,26 +1227,14 @@ def screen_progress(scr, selected, dry_run):
     return state, freed_total[0]
 
 
-def parse_size_to_kb(s):
-    """Parse a human-readable size string to KB."""
-    m = re.match(r'([\d.]+)\s*([KMGTP])', s, re.IGNORECASE)
-    if not m:
-        return 0
-    val = float(m.group(1))
-    unit = m.group(2).upper()
-    mult = {"K": 1, "M": 1024, "G": 1024**2, "T": 1024**3, "P": 1024**4}
-    return int(val * mult.get(unit, 1))
-
-
 # ─────────────────────────────────────────────────────────
-#  SCREEN 3: SUMMARY
+#  TUI: SCREEN 3 — SUMMARY
 # ─────────────────────────────────────────────────────────
 
 def screen_summary(scr, state, disk_before, freed_kb, dry_run):
     disk_after = disk_info()
     ordered = list(state.keys())
 
-    # Separate results into categories
     freed_cats = [(c, state[c]) for c in ordered if state[c]["status"] == "freed"]
     clean_cats = [(c, state[c]) for c in ordered if state[c]["status"] == "clean"]
     other_cats = [(c, state[c]) for c in ordered if state[c]["status"] not in ("freed", "clean")]
@@ -873,10 +1328,102 @@ def screen_summary(scr, state, disk_before, freed_kb, dry_run):
 
 
 # ─────────────────────────────────────────────────────────
+#  CLI MODE
+# ─────────────────────────────────────────────────────────
+
+def cli_main():
+    """Handle CLI mode (non-TUI)."""
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="sclean",
+        description="sclean — System Cleanup Tool for Arch/CachyOS")
+    parser.add_argument("-n", "--dry-run", action="store_true",
+                        help="Show what would be cleaned without deleting")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="Skip confirmation prompts")
+    parser.add_argument("--only", type=str, metavar="CATS",
+                        help="Run ONLY specified categories (comma-separated)")
+    parser.add_argument("--skip", type=str, metavar="CATS",
+                        help="Skip specified categories (comma-separated)")
+    parser.add_argument("--list", action="store_true",
+                        help="List available categories and exit")
+    args = parser.parse_args()
+
+    if args.list:
+        print("\nAvailable categories:\n")
+        for cat_id, label, desc, optin in CATEGORIES:
+            tag = " (opt-in)" if optin else ""
+            print(f"  {cat_id:<20s} {desc}{tag}")
+        print()
+        return
+
+    # Determine categories to run
+    if args.only:
+        cats = [c.strip() for c in args.only.split(",")]
+    else:
+        cats = [c[0] for c in CATEGORIES if not c[3]]
+        if args.skip:
+            skip = {c.strip() for c in args.skip.split(",")}
+            cats = [c for c in cats if c not in skip]
+
+    total = len(cats)
+    if total == 0:
+        print("  No categories selected.")
+        return
+
+    # Confirmation
+    if not args.dry_run and not args.yes:
+        print(f"\n  sclean will run {total} cleanup categories.")
+        try:
+            answer = input("  Continue? [Y/n]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Cancelled.")
+            return
+        if answer and not answer.lower().startswith("y"):
+            print("  Cancelled.")
+            return
+
+    mode = "Dry Run" if args.dry_run else "Cleanup"
+    print(f"\n  sclean — {mode} ({total} categories)\n")
+
+    total_freed = 0
+    for i, cat in enumerate(cats, 1):
+        label = CAT_LABEL.get(cat, cat)
+        print(f"  [{i}/{total}] {label}...", end=" ", flush=True)
+        cleaner = CLEANERS.get(cat)
+        if not cleaner:
+            print("? unknown category")
+            continue
+        result = cleaner(args.dry_run)
+        freed_kb = result["freed_kb"]
+        total_freed += freed_kb
+        status = result["status"]
+        detail = result["detail"]
+
+        if status == "freed":
+            print(f"✓ {detail}")
+        elif status == "scanned":
+            print(f"~ {detail}")
+        elif status == "skipped":
+            print(f"— {detail}")
+        else:
+            print(f"· {detail}")
+
+    print()
+    if total_freed > 0:
+        print(f"  Total freed: {human_kb(total_freed)}")
+    else:
+        print("  System was already clean.")
+    if args.dry_run:
+        print("  (dry run — nothing was deleted)")
+    print()
+
+
+# ─────────────────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────────────────
 
-def main(stdscr):
+def tui_main(stdscr):
     try:
         curses.curs_set(0)
     except curses.error:
@@ -887,24 +1434,24 @@ def main(stdscr):
         chosen, dry_run = screen_select(stdscr)
         if chosen is None:
             break
-
         disk_before = disk_info()
-
         state, freed_kb = screen_progress(stdscr, chosen, dry_run)
-
         action = screen_summary(stdscr, state, disk_before, freed_kb, dry_run)
         if action == "quit":
             break
 
 
 if __name__ == "__main__":
-    SCLEAN = _find_sclean_core()
-
-    # If called with any CLI arguments, pass through to sclean-core directly
-    # (preserves full CLI compatibility: sclean -n -y --only cache, etc.)
     if len(sys.argv) > 1:
-        os.execvp(SCLEAN, [SCLEAN] + sys.argv[1:])
-
-    # No arguments: launch TUI
-    ensure_sudo()
-    curses.wrapper(main)
+        # CLI mode — handle --help before sudo
+        if not any(a in sys.argv for a in ["-h", "--help", "--list"]):
+            ensure_sudo()
+        cli_main()
+    else:
+        # TUI mode
+        if not sys.stdin.isatty():
+            print("sclean: interactive mode requires a terminal. Use --help for CLI options.",
+                  file=sys.stderr)
+            sys.exit(1)
+        ensure_sudo()
+        curses.wrapper(tui_main)
