@@ -149,7 +149,12 @@ def clean_orphans(dry_run):
     current = r.stdout.strip().split("\n") if r.returncode == 0 and r.stdout.strip() else []
     if not current:
         return _clean("orphans already resolved")
-    pkg_cmd = ["yay", "-Rns", "--noconfirm"] if _has("yay") else ["sudo", "pacman", "-Rns", "--noconfirm"]
+    if _has("paru"):
+        pkg_cmd = ["paru", "-Rns", "--noconfirm"]
+    elif _has("yay"):
+        pkg_cmd = ["yay", "-Rns", "--noconfirm"]
+    else:
+        pkg_cmd = ["sudo", "pacman", "-Rns", "--noconfirm"]
     _run(pkg_cmd + current, timeout=120)
     return _result("freed", f"removed {count} orphans")
 
@@ -167,32 +172,46 @@ def clean_deep_orphans(dry_run):
     current = r.stdout.strip().split("\n") if r.returncode == 0 and r.stdout.strip() else []
     if not current:
         return _clean("deep orphans already resolved")
-    pkg_cmd = ["yay", "-Rns", "--noconfirm"] if _has("yay") else ["sudo", "pacman", "-Rns", "--noconfirm"]
+    if _has("paru"):
+        pkg_cmd = ["paru", "-Rns", "--noconfirm"]
+    elif _has("yay"):
+        pkg_cmd = ["yay", "-Rns", "--noconfirm"]
+    else:
+        pkg_cmd = ["sudo", "pacman", "-Rns", "--noconfirm"]
     _run(pkg_cmd + current, timeout=120)
     return _result("freed", f"removed {count} deep orphans")
 
 
 def clean_cache(dry_run):
-    """Clean pacman + AUR package cache."""
+    """Clean pacman + AUR package cache (yay/paru)."""
     pkg_dir = Path("/var/cache/pacman/pkg")
     yay_dir = Path.home() / ".cache" / "yay"
+    paru_dir = Path.home() / ".cache" / "paru"
     before = _dir_size_kb(pkg_dir) if pkg_dir.is_dir() else 0
     if yay_dir.is_dir():
         before += _dir_size_kb(yay_dir)
+    if paru_dir.is_dir():
+        before += _dir_size_kb(paru_dir)
     if dry_run:
         return _scanned(f"would clean cache ({human_kb(before)})")
     if _has("paccache"):
         _run(["sudo", "paccache", "-rk1"], timeout=120)
         _run(["sudo", "paccache", "-ruk0"], timeout=120)
+    elif _has("paru"):
+        _run(["paru", "-Scc", "--noconfirm"], timeout=120)
     elif _has("yay"):
         _run(["yay", "-Scc", "--noconfirm"], timeout=120)
     else:
         _run(["sudo", "pacman", "-Scc", "--noconfirm"], timeout=120)
     if yay_dir.is_dir():
         _rm_contents(yay_dir)
+    if paru_dir.is_dir():
+        _rm_contents(paru_dir)
     after = _dir_size_kb(pkg_dir) if pkg_dir.is_dir() else 0
     if yay_dir.is_dir():
         after += _dir_size_kb(yay_dir)
+    if paru_dir.is_dir():
+        after += _dir_size_kb(paru_dir)
     freed = max(0, before - after)
     return _freed(freed) if freed > 0 else _clean()
 
@@ -774,6 +793,138 @@ def clean_stale_procs(dry_run):
             pass
     return _result("freed", f"terminated {len(stale)} stale processes")
 
+def clean_gpu_cache(dry_run):
+    """Clean Electron/Chromium GPUCache and shader cache in ~/.config."""
+    home = Path.home()
+    config_dir = home / ".config"
+    gpu_dirs = []
+    if config_dir.is_dir():
+        gpu_dirs = _find(str(config_dir), "-maxdepth", "4", "-name", "GPUCache", "-type", "d")
+    if not gpu_dirs:
+        return _clean("no GPU cache dirs")
+    total_kb = sum(_dir_size_kb(d) for d in gpu_dirs)
+    if total_kb == 0:
+        return _clean("GPU cache empty")
+    if dry_run:
+        return _scanned(f"would clear {len(gpu_dirs)} GPUCache dirs ({human_kb(total_kb)})")
+    for d in gpu_dirs:
+        _rm_contents(d)
+    return _freed(total_kb)
+
+
+def clean_pacman_db_lock(dry_run):
+    """Remove stale pacman database lock file."""
+    lock = Path("/var/lib/pacman/db.lck")
+    if not lock.exists():
+        return _clean("no stale lock")
+    # Check if pacman is actually running
+    r = _run(["pgrep", "-x", "pacman"])
+    if r.returncode == 0 and r.stdout.strip():
+        return _clean("pacman is running, lock is valid")
+    if dry_run:
+        return _scanned("would remove stale pacman db.lck")
+    _run(["sudo", "rm", "-f", str(lock)])
+    return _result("freed", "removed stale db.lck")
+
+
+def clean_baloo_index(dry_run):
+    """Clean KDE Baloo file search index."""
+    baloo_dir = Path.home() / ".local" / "share" / "baloo"
+    if not baloo_dir.is_dir():
+        return _clean("no Baloo index")
+    total_kb = _dir_size_kb(baloo_dir)
+    if total_kb < 10:  # less than 10KB, not worth cleaning
+        return _clean("Baloo index is small")
+    if dry_run:
+        return _scanned(f"would rebuild Baloo index ({human_kb(total_kb)})")
+    # balooctl6 (Plasma 6) or balooctl (Plasma 5)
+    ctl = "balooctl6" if _has("balooctl6") else "balooctl" if _has("balooctl") else None
+    if ctl:
+        _run([ctl, "purge"], timeout=30)
+    else:
+        _rm_contents(baloo_dir)
+    after = _dir_size_kb(baloo_dir)
+    freed = max(0, total_kb - after)
+    return _freed(freed) if freed > 0 else _result("freed", "purged Baloo index")
+
+
+def clean_man_cache(dry_run):
+    """Clean man page cache."""
+    man_dir = Path("/var/cache/man")
+    if not man_dir.is_dir():
+        return _clean("no man cache")
+    total_kb = _dir_size_kb(man_dir)
+    if total_kb < 1:
+        return _clean("man cache empty")
+    if dry_run:
+        return _scanned(f"would clean man cache ({human_kb(total_kb)})")
+    _run(["sudo", "find", str(man_dir), "-type", "f", "-name", "*.gz", "-delete"], timeout=30)
+    _run(["sudo", "find", str(man_dir), "-type", "d", "-empty", "-delete"], timeout=15)
+    after = _dir_size_kb(man_dir)
+    freed = max(0, total_kb - after)
+    return _freed(freed) if freed > 0 else _clean()
+
+
+def clean_font_cache(dry_run):
+    """Clean fontconfig cache and rebuild."""
+    fc_dir = Path.home() / ".cache" / "fontconfig"
+    if not fc_dir.is_dir():
+        return _clean("no font cache")
+    total_kb = _dir_size_kb(fc_dir)
+    if total_kb < 1:
+        return _clean("font cache empty")
+    if dry_run:
+        return _scanned(f"would rebuild font cache ({human_kb(total_kb)})")
+    _rm_contents(fc_dir)
+    if _has("fc-cache"):
+        _run(["fc-cache", "-f"], timeout=30)
+    after = _dir_size_kb(fc_dir)
+    freed = max(0, total_kb - after)
+    return _freed(freed) if freed > 0 else _clean("rebuilt cache")
+
+
+def clean_recent_files(dry_run):
+    """Clean GTK recent files list and similar trackers."""
+    home = Path.home()
+    files = [
+        home / ".local" / "share" / "recently-used.xbel",
+        home / ".local" / "share" / "recently-used.xbel.bak",
+    ]
+    total = 0
+    found = []
+    for f in files:
+        if f.is_file():
+            try:
+                total += f.stat().st_size
+                found.append(f)
+            except OSError:
+                pass
+    if not found:
+        return _clean("no recent files list")
+    total_kb = total // 1024
+    if dry_run:
+        return _scanned(f"would clear recent files list ({human_kb(total_kb)})")
+    for f in found:
+        try:
+            f.write_text("")  # truncate rather than delete (apps recreate it)
+        except OSError:
+            pass
+    return _freed(total_kb) if total_kb > 0 else _result("freed", "cleared recent files")
+
+
+def clean_unowned_files(dry_run):
+    """Check for files not owned by any package in key dirs (info only)."""
+    if not _has("pacman"):
+        return _skipped()
+    # Quick check in /etc and /usr/local only
+    r = _run(["pacman", "-Qqo", "/etc/"], timeout=30)
+    # This is info-only; we never delete
+    r2 = _run(["find", "/usr/local/bin", "-type", "f"], timeout=10)
+    local_files = r2.stdout.strip().split("\n") if r2.returncode == 0 and r2.stdout.strip() else []
+    if not local_files:
+        return _clean("no unowned files found")
+    return _result("clean", f"found {len(local_files)} files in /usr/local/bin (manual review)")
+
 
 # ─────────────────────────────────────────────────────────
 #  CATEGORIES & DISPATCH
@@ -800,14 +951,21 @@ CATEGORIES = [
     ("systemd-failed",   "Failed Units",      "Reset failed systemd units",         False),
     ("service-leftovers","Service Leftovers", "Broken systemd entries",             False),
     ("browser-cache",    "Browser Cache",     "Browser cache data",                False),
+    ("gpu-cache",        "GPU Cache",         "Electron/Chromium GPUCache dirs",    False),
+    ("font-cache",       "Font Cache",        "Fontconfig cache rebuild",           False),
+    ("recent-files",     "Recent Files",      "GTK recently-used.xbel",             False),
     # ── Opt-in ──
     ("deep-orphans",     "Deep Orphans",      "Incl. optional deps",               True),
+    ("pacman-db-lock",   "Pacman DB Lock",    "Remove stale db.lck",                True),
     ("pacnew",           "Pacnew Files",      ".pacnew/.pacsave (info only)",       True),
     ("foreign-packages", "Foreign Packages",  "AUR/manual packages (info only)",    True),
+    ("unowned-files",    "Unowned Files",     "/usr/local/bin files (info only)",   True),
     ("locale-purge",     "Locale Purge",      "Unused locale/translations",         True),
     ("docker",           "Docker",            "Prune containers/images/volumes",    True),
     ("snap",             "Snap",              "Old snap revisions",                 True),
     ("kde-cache",        "KDE Cache",         "KDE/Plasma offline caches",          True),
+    ("baloo-index",      "Baloo Index",       "KDE file search index",              True),
+    ("man-cache",        "Man Cache",         "Man page cache files",               True),
     ("tmpfiles-clean",   "Tmpfiles",          "systemd-tmpfiles aging rules",       True),
     ("stale-procs",      "Stale Processes",   "Processes with deleted binaries",    True),
 ]
@@ -834,12 +992,19 @@ CLEANERS = {
     "systemd-failed":   clean_systemd_failed,
     "service-leftovers":clean_service_leftovers,
     "browser-cache":    clean_browser_cache,
+    "gpu-cache":        clean_gpu_cache,
+    "font-cache":       clean_font_cache,
+    "recent-files":     clean_recent_files,
+    "pacman-db-lock":   clean_pacman_db_lock,
     "pacnew":           clean_pacnew,
     "foreign-packages": clean_foreign_packages,
+    "unowned-files":    clean_unowned_files,
     "locale-purge":     clean_locale_purge,
     "docker":           clean_docker,
     "snap":             clean_snap,
     "kde-cache":        clean_kde_cache,
+    "baloo-index":      clean_baloo_index,
+    "man-cache":        clean_man_cache,
     "tmpfiles-clean":   clean_tmpfiles,
     "stale-procs":      clean_stale_procs,
 }
