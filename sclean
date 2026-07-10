@@ -752,6 +752,36 @@ def clean_tmpfiles(dry_run):
 
 def clean_stale_procs(dry_run):
     """Kill stale user processes with deleted binaries."""
+    stale = _find_stale_procs()
+    if not stale:
+        return _clean("no stale processes")
+    total_rss = sum(r for _, _, r in stale)
+    if dry_run:
+        return _scanned(f"would terminate {len(stale)} stale procs ({human_kb(total_rss)})")
+    n = _kill_pids([p for p, _, _ in stale])
+    return _result("freed", f"terminated {n} stale processes ({human_kb(total_rss)} RSS)")
+
+
+def _meminfo_kb():
+    """Parse /proc/meminfo → {key: value_kb}."""
+    info = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if ":" not in line:
+                    continue
+                key, rest = line.split(":", 1)
+                try:
+                    info[key] = int(rest.strip().split()[0])
+                except (ValueError, IndexError):
+                    pass
+    except OSError:
+        pass
+    return info
+
+
+def _find_stale_procs():
+    """User processes whose binary was deleted (upgrade leftovers)."""
     uid = os.getuid()
     stale = []
     for entry in Path("/proc").iterdir():
@@ -774,15 +804,16 @@ def clean_stale_procs(dry_run):
             stale.append((pid, comm, rss))
         except (OSError, IndexError, ValueError, KeyError):
             continue
-    if not stale:
-        return _clean("no stale processes")
-    total_rss = sum(r for _, _, r in stale)
-    if dry_run:
-        return _scanned(f"would terminate {len(stale)} stale procs ({human_kb(total_rss)})")
-    pids = [p for p, _, _ in stale]
+    return stale
+
+
+def _kill_pids(pids):
+    """SIGTERM then SIGKILL. Returns how many were signaled."""
+    n = 0
     for pid in pids:
         try:
             os.kill(pid, signal.SIGTERM)
+            n += 1
         except OSError:
             pass
     time.sleep(1)
@@ -791,7 +822,146 @@ def clean_stale_procs(dry_run):
             os.kill(pid, signal.SIGKILL)
         except OSError:
             pass
-    return _result("freed", f"terminated {len(stale)} stale processes")
+    return n
+
+
+def _sudo_write(path, value):
+    """Write a sysctl/proc value via sudo. Returns True on success."""
+    r = _run(["sudo", "sh", "-c", f"printf '%s' '{value}' > {path}"], timeout=10)
+    return r.returncode == 0
+
+
+# Heavy browser-like processes safe to offer as optional session targets.
+# Desktop-critical names are never matched here.
+_HEAVY_COMM = {
+    "chrome", "chromium", "chrome_crashpad", "firefox", "firefox-bin",
+    "slack", "discord", "telegram", "telegram-desk", "code", "code-oss",
+    "cursor", "spotify", "teams", "zoom", "obs", "electron",
+}
+
+
+def _find_heavy_user_procs(min_rss_kb=80 * 1024):
+    """Return [(pid, comm, rss_kb)] for heavy user apps (not desktop shell)."""
+    uid = os.getuid()
+    # Never kill the desktop / this tool
+    protected = {
+        "plasmashell", "kwin_wayland", "kwin_x11", "kded6", "kded5",
+        "Xorg", "wayland", "systemd", "dbus-daemon", "pipewire",
+        "pipewire-pulse", "wireplumber", "sclean", "python3", "grok",
+        "fish", "bash", "zsh", "ghostty", "konsole", "kitty", "alacritty",
+    }
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid in (os.getpid(), os.getppid()):
+            continue
+        try:
+            status = (entry / "status").read_text()
+            lines = {l.split(":")[0]: l.split(":", 1)[1].strip()
+                     for l in status.split("\n") if ":" in l}
+            if int(lines.get("Uid", "").split()[0]) != uid:
+                continue
+            comm = lines.get("Name", "?")
+            if comm in protected:
+                continue
+            rss = int(lines.get("VmRSS", "0").split()[0])
+            # Match known heavy apps, or any single process using a lot of RSS
+            name_l = comm.lower()
+            is_heavy_name = any(h in name_l for h in _HEAVY_COMM)
+            if not is_heavy_name and rss < min_rss_kb:
+                continue
+            if not is_heavy_name:
+                continue  # only known heavy app families; avoid killing random stuff
+            found.append((pid, comm, rss))
+        except (OSError, IndexError, ValueError, KeyError):
+            continue
+    # Group by name for summary; keep per-pid for kill
+    found.sort(key=lambda x: -x[2])
+    return found
+
+
+def clean_session_boost(dry_run):
+    """Reclaim RAM for the *current* session (caches, compact, stale procs).
+
+    This does NOT free memory held by running apps (Chrome etc.).
+    For that use the opt-in 'heavy-apps' category or reboot.
+    """
+    before = _meminfo_kb()
+    before_avail = before.get("MemAvailable", before.get("MemFree", 0))
+    before_swap = before.get("SwapFree", 0)
+
+    stale = _find_stale_procs()
+    stale_rss = sum(r for _, _, r in stale)
+
+    if dry_run:
+        bits = [f"drop page caches + compact memory (avail {human_kb(before_avail)})"]
+        if stale:
+            bits.append(f"kill {len(stale)} stale procs ({human_kb(stale_rss)} RSS)")
+        return _scanned("; ".join(bits))
+
+    actions = []
+
+    # 1. Flush dirty pages so drop_caches can reclaim more
+    _run(["sync"], timeout=60)
+
+    # 2. Drop page cache + dentries + inodes (needs root)
+    if _sudo_write("/proc/sys/vm/drop_caches", "3"):
+        actions.append("dropped page caches")
+    else:
+        actions.append("page caches skipped (need root)")
+
+    # 3. Compact fragmented memory (helps on long-uptime low-RAM boxes)
+    if _sudo_write("/proc/sys/vm/compact_memory", "1"):
+        actions.append("compacted memory")
+
+    # 4. Kill leftover processes with deleted binaries
+    if stale:
+        n = _kill_pids([p for p, _, _ in stale])
+        if n:
+            actions.append(f"killed {n} stale procs ({human_kb(stale_rss)} RSS)")
+
+    time.sleep(0.4)
+    after = _meminfo_kb()
+    after_avail = after.get("MemAvailable", after.get("MemFree", 0))
+    after_swap = after.get("SwapFree", 0)
+    gained = max(0, after_avail - before_avail)
+    swap_gained = max(0, after_swap - before_swap)
+
+    detail = f"{'; '.join(actions)}; avail {human_kb(before_avail)} → {human_kb(after_avail)}"
+    if swap_gained:
+        detail += f"; swap free +{human_kb(swap_gained)}"
+
+    if gained > 0:
+        return _freed(gained, f"reclaimed ~{human_kb(gained)} RAM ({detail})")
+    return _result("clean", detail)
+
+
+def clean_heavy_apps(dry_run):
+    """Terminate known heavy user apps (browsers, Electron apps) to free RAM.
+
+    Opt-in only — this closes real applications.
+    """
+    procs = _find_heavy_user_procs()
+    if not procs:
+        return _clean("no heavy apps found")
+    # Collapse by comm for messaging
+    by_name = {}
+    for pid, comm, rss in procs:
+        by_name.setdefault(comm, {"pids": [], "rss": 0})
+        by_name[comm]["pids"].append(pid)
+        by_name[comm]["rss"] += rss
+    total_rss = sum(v["rss"] for v in by_name.values())
+    summary = ", ".join(
+        f"{name}×{len(v['pids'])}" for name, v in sorted(by_name.items(), key=lambda x: -x[1]["rss"])
+    )
+    if dry_run:
+        return _scanned(f"would kill {summary} ({human_kb(total_rss)} RSS)")
+    n = _kill_pids([p for p, _, _ in procs])
+    time.sleep(0.5)
+    return _freed(total_rss, f"terminated {n} procs: {summary} ({human_kb(total_rss)} RSS)")
+
 
 def clean_gpu_cache(dry_run):
     """Clean Electron/Chromium GPUCache and shader cache in ~/.config."""
@@ -968,6 +1138,8 @@ CATEGORIES = [
     ("man-cache",        "Man Cache",         "Man page cache files",               True),
     ("tmpfiles-clean",   "Tmpfiles",          "systemd-tmpfiles aging rules",       True),
     ("stale-procs",      "Stale Processes",   "Processes with deleted binaries",    True),
+    ("session-boost",    "Session Boost",     "Drop caches + compact RAM (session)", True),
+    ("heavy-apps",       "Heavy Apps",        "Kill browsers/Electron apps (RAM)",  True),
 ]
 
 CLEANERS = {
@@ -1007,6 +1179,8 @@ CLEANERS = {
     "man-cache":        clean_man_cache,
     "tmpfiles-clean":   clean_tmpfiles,
     "stale-procs":      clean_stale_procs,
+    "session-boost":    clean_session_boost,
+    "heavy-apps":       clean_heavy_apps,
 }
 
 EXEC_ORDER = [c[0] for c in CATEGORIES]
@@ -1512,6 +1686,12 @@ def cli_main():
                         help="Skip specified categories (comma-separated)")
     parser.add_argument("--list", action="store_true",
                         help="List available categories and exit")
+    parser.add_argument("--boost", action="store_true",
+                        help="Session speed-up only: drop caches, compact RAM, "
+                             "kill stale procs (skips disk cleanup)")
+    parser.add_argument("--boost-hard", action="store_true",
+                        help="Like --boost, and also quit heavy apps "
+                             "(Chrome/Firefox/Electron) to free RAM")
     args = parser.parse_args()
 
     if args.list:
@@ -1520,10 +1700,18 @@ def cli_main():
             tag = " (opt-in)" if optin else ""
             print(f"  {cat_id:<20s} {desc}{tag}")
         print()
+        print("Session speed-up shortcuts:")
+        print("  sclean --boost       reclaim RAM (caches/compact/stale procs)")
+        print("  sclean --boost-hard  also quit browsers/Electron apps")
+        print()
         return
 
     # Determine categories to run
-    if args.only:
+    if args.boost or args.boost_hard:
+        cats = ["session-boost"]
+        if args.boost_hard:
+            cats.append("heavy-apps")
+    elif args.only:
         cats = [c.strip() for c in args.only.split(",")]
     else:
         cats = [c[0] for c in CATEGORIES if not c[3]]
